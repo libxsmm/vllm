@@ -62,7 +62,7 @@ def main() -> None:
 
     import vllm._custom_ops  # noqa: F401  (loads the right _C variant)
 
-    print("libxsmm target arch:", torch.ops._C.xsmm_target_arch())
+    print("ternary target isa:", torch.ops._C.xsmm_target_arch())
 
     torch.manual_seed(0)
     dtype = getattr(torch, args.dtype)

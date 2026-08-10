@@ -636,7 +636,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("cpu_gemm_wna16", torch::kCPU, &cpu_gemm_wna16);
 #endif
 
-  // LIBXSMM ternary (2-bit weight / int8 activation) GEMM
+  // Ternary (2-bit weight / int8 activation) GEMM
 #ifdef VLLM_ENABLE_XSMM_TERNARY
   ops.def(
       "xsmm_ternary_pack_weight(Tensor weight, SymInt group_size, "

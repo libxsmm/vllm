@@ -1,20 +1,20 @@
-// Ternary (2-bit) weight x int8 activation GEMM for x86 CPUs, using LIBXSMM
-// JIT microkernels.
+// Ternary (2-bit) weight x int8 activation GEMM for x86 CPUs, using pure AVX2
+// intrinsics (no external GEMM library).
 //
 // Pipeline (mirrors the tpp-pytorch-extension `qint2_intlv` recipe):
-//   1. weights are quantized to ternary + per-group fp32 scales and packed into
+//   1. weights are quantized to ternary + per-group scales and packed into
 //      the VNNI4/interleaved layout once, at model load time;
 //   2. at inference the 16-bit activations are quantized per (row, group) to
 //      int8;
-//   3. LIBXSMM runs an int2 x int8 -> int32 BRGEMM;
+//   3. an int2 x int8 -> int32 microkernel reduces over each group;
 //   4. the int32 accumulator is dequantized with (act_scale * weight_scale).
 //
-// The int2 microkernel is only generated for LIBXSMM_X86_AVX2_SRF, i.e. AVX2 +
-// AVX-VNNI-INT8 + AVX-NE-CONVERT.
+// The microkernel needs AVX2 + AVX-VNNI-INT8; without it the portable scalar
+// reference is used.
 
 #include <torch/all.h>
 
-#include <libxsmm.h>
+#include "xsmm_ternary_micro.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -22,9 +22,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <mutex>
 #include <type_traits>
-#include <unordered_map>
 #include <vector>
 
 #if defined(__AVX2__)
@@ -34,8 +32,7 @@
 
 namespace {
 
-// One 32-byte ymm load of packed weights feeds 32 output columns; fixed by the
-// LIBXSMM int2 microkernel.
+// One 32-byte ymm load of packed weights feeds 32 output columns.
 constexpr int64_t kBlockN = 32;
 // VNNI4: 4 consecutive reduction elements are interleaved.
 constexpr int64_t kVnni = 4;
@@ -47,85 +44,6 @@ constexpr int64_t kPack = 4;
 constexpr int64_t kBlockM = 32;
 
 static_assert(kBlockN == kLanes * kPack, "N block must be lanes x pack factor");
-
-struct GemmKey {
-  int32_t m, n, k, lda, ldb, ldc;
-
-  bool operator==(const GemmKey& o) const {
-    return m == o.m && n == o.n && k == o.k && lda == o.lda && ldb == o.ldb &&
-           ldc == o.ldc;
-  }
-};
-
-struct GemmKeyHash {
-  size_t operator()(const GemmKey& k) const {
-    size_t h = 1469598103934665603ULL;
-    const auto* p = reinterpret_cast<const uint8_t*>(&k);
-    for (size_t i = 0; i < sizeof(GemmKey); ++i) {
-      h = (h ^ p[i]) * 1099511628211ULL;
-    }
-    return h;
-  }
-};
-
-// JIT kernels are generated once and reused for the lifetime of the process.
-libxsmm_gemmfunction get_ternary_kernel(const GemmKey& key) {
-  static std::unordered_map<GemmKey, libxsmm_gemmfunction, GemmKeyHash> cache;
-  static std::mutex mutex;
-  static std::once_flag init_once;
-  std::call_once(init_once, [] { libxsmm_init(); });
-
-  std::lock_guard<std::mutex> guard(mutex);
-  auto it = cache.find(key);
-  if (it != cache.end()) {
-    return it->second;
-  }
-
-  libxsmm_gemm_shape shape;
-  std::memset(&shape, 0, sizeof(shape));
-  // LIBXSMM's A operand is the packed weight, its B operand the activations.
-  shape.m = key.m;
-  shape.n = key.n;
-  shape.k = key.k;
-  shape.lda = key.lda;
-  shape.ldb = key.ldb;
-  shape.ldc = key.ldc;
-  shape.a_in_type = LIBXSMM_DATATYPE_I8;
-  shape.b_in_type = LIBXSMM_DATATYPE_I8;
-  shape.out_type = LIBXSMM_DATATYPE_I32;
-  shape.comp_type = LIBXSMM_DATATYPE_I32;
-
-  const libxsmm_bitfield flags = LIBXSMM_GEMM_FLAGS('N', 'N') |
-      LIBXSMM_GEMM_FLAG_VNNI_A |
-      LIBXSMM_GEMM_FLAG_INTERPRETE_A_AS_INT2_VNNI4_INTLV |
-      LIBXSMM_GEMM_FLAG_BETA_0;
-
-  libxsmm_gemm_batch_reduce_config brconfig;
-  std::memset(&brconfig, 0, sizeof(brconfig));
-  brconfig.br_type = LIBXSMM_GEMM_BATCH_REDUCE_STRIDE;
-  // 4 ternary values per byte
-  brconfig.br_stride_a_hint = key.k * key.lda / kPack;
-  brconfig.br_stride_b_hint = key.k;
-  brconfig.br_unroll_hint = 1;
-
-  libxsmm_gemmfunction fn =
-      libxsmm_dispatch_brgemm(shape, flags, /*prefetch=*/0, brconfig);
-  TORCH_CHECK(
-      fn != nullptr,
-      "LIBXSMM failed to JIT an int2xint8 kernel (m=",
-      key.m,
-      " n=",
-      key.n,
-      " k=",
-      key.k,
-      "). The AVX2/SRF int2 microkernel requires AVX-VNNI-INT8 and "
-      "AVX-NE-CONVERT; libxsmm target arch is '",
-      libxsmm_get_target_arch(),
-      "'.");
-
-  cache.emplace(key, fn);
-  return fn;
-}
 
 inline int8_t ternary_code(float scaled) {
   const float r = std::nearbyintf(scaled);
@@ -337,8 +255,6 @@ void quantize_activations(
 }
 
 struct TernaryGemmPlan {
-  libxsmm_gemmfunction k_full;
-  libxsmm_gemmfunction k_rem;
   int64_t M, N1, C1, C, G;
   int64_t m_full, m_blocks, m_rem;
 };
@@ -370,6 +286,78 @@ TernaryScratch& ternary_scratch() {
   return s;
 }
 
+// Cached once: without AVX-VNNI-INT8 the portable scalar reference is used.
+bool ternary_have_simd() {
+  static const bool ok = vllm_ternary::ternary_intrinsics_supported();
+  return ok;
+}
+
+// One (N-block, row-block) tile. Rows are consumed 2 at a time, which is the
+// most that fits without spilling the 8 accumulators.
+template <typename scalar_t, typename wscale_t>
+inline void ternary_tile_intrinsics(
+    const TernaryGemmPlan& plan,
+    const vllm_ternary::TernaryLuts& luts,
+    const uint8_t* __restrict w_panel,
+    const wscale_t* __restrict ws_panel,
+    const int8_t* __restrict xq_rows,
+    const float* __restrict xs_rows,
+    int64_t m_cur,
+    int64_t group_bytes,
+    const scalar_t* __restrict bias_row,
+    scalar_t* __restrict out_rows,
+    int64_t N,
+    int32_t* __restrict acc_i32,
+    float* __restrict acc) {
+  const int64_t C1 = plan.C1;
+  const int64_t kRowChunk = 2;
+#ifdef XSMM_TERNARY_HAVE_X86
+  const bool simd = ternary_have_simd();
+#endif
+  for (int64_t c1 = 0; c1 < C1; ++c1) {
+    const uint8_t* a = w_panel + c1 * group_bytes;
+    const int8_t* b = xq_rows + c1 * plan.G;
+
+    for (int64_t m = 0; m < m_cur; m += kRowChunk) {
+      const int64_t rows = std::min<int64_t>(kRowChunk, m_cur - m);
+      const int8_t* b_rows = b + m * plan.C;
+      int32_t* c_rows = acc_i32 + m * kBlockN;
+#ifdef XSMM_TERNARY_HAVE_X86
+      if (simd) {
+        if (rows == 2) {
+          vllm_ternary::ternary_micro<2>(a, b_rows, plan.C, c_rows, plan.G, luts);
+        } else {
+          vllm_ternary::ternary_micro<1>(a, b_rows, plan.C, c_rows, plan.G, luts);
+        }
+      } else {
+        vllm_ternary::ternary_micro_scalar(
+            a, b_rows, plan.C, c_rows, plan.G, static_cast<int>(rows));
+      }
+#else
+      vllm_ternary::ternary_micro_scalar(
+          a, b_rows, plan.C, c_rows, plan.G, static_cast<int>(rows));
+#endif
+    }
+
+    const wscale_t* wsc = ws_panel + c1 * kBlockN;
+    const bool first = (c1 == 0);
+    const bool last = (c1 + 1 == C1);
+    for (int64_t m = 0; m < m_cur; ++m) {
+      const int32_t* src = acc_i32 + m * kBlockN;
+      float* a_f = acc + m * kBlockN;
+      const float xsc = xs_rows[m * C1 + c1];
+      if (last) {
+        dequant_finalize<scalar_t, wscale_t>(
+            src, a_f, !first, xsc, wsc, bias_row, out_rows + m * N);
+      } else if (first) {
+        dequant_store<wscale_t>(src, a_f, xsc, wsc);
+      } else {
+        dequant_accum<wscale_t>(src, a_f, xsc, wsc);
+      }
+    }
+  }
+}
+
 template <typename scalar_t, typename wscale_t>
 void ternary_gemm_tiles(
     const TernaryGemmPlan& plan,
@@ -387,17 +375,19 @@ void ternary_gemm_tiles(
 
 #pragma omp parallel
   {
-    // per-thread state: the gemm_param zeroing happens once per thread rather
-    // than once per tile, and the accumulators never need pre-zeroing because
-    // the first reduction group stores instead of accumulating.
+    // per-thread state: the accumulators never need pre-zeroing because the
+    // first reduction group stores instead of accumulating.
     alignas(64) int32_t acc_i32[kBlockM * kBlockN];
     alignas(64) float acc[kBlockM * kBlockN];
 
-    libxsmm_gemm_param gemm_param;
-    std::memset(&gemm_param, 0, sizeof(gemm_param));
-    unsigned long long br_count = 1;
-    gemm_param.op.tertiary = &br_count;
-    gemm_param.c.primary = acc_i32;
+#ifdef XSMM_TERNARY_HAVE_X86
+    // decode tables are loop-invariant, so build them once per thread
+    const vllm_ternary::TernaryLuts luts = ternary_have_simd()
+        ? vllm_ternary::make_ternary_luts()
+        : vllm_ternary::TernaryLuts{};
+#else
+    const vllm_ternary::TernaryLuts luts{};
+#endif
 
 #pragma omp for schedule(dynamic, 1)
     for (int64_t work = 0; work < n_work; ++work) {
@@ -406,35 +396,12 @@ void ternary_gemm_tiles(
       const int64_t m0 = mb * plan.m_full;
       const int64_t m_cur =
           (mb + 1 == plan.m_blocks) ? plan.m_rem : plan.m_full;
-      const auto kernel = (m_cur == plan.m_full) ? plan.k_full : plan.k_rem;
       const scalar_t* bias_row = (bias != nullptr) ? bias + n1 * kBlockN : nullptr;
 
-      for (int64_t c1 = 0; c1 < C1; ++c1) {
-        gemm_param.a.primary =
-            const_cast<uint8_t*>(w + n1 * panel_bytes + c1 * group_bytes);
-        gemm_param.b.primary =
-            const_cast<int8_t*>(xq + m0 * plan.C + c1 * plan.G);
-        kernel(&gemm_param);
-
-        const wscale_t* wsc = ws + (n1 * C1 + c1) * kBlockN;
-        const bool first = (c1 == 0);
-        const bool last = (c1 + 1 == C1);
-
-        for (int64_t m = 0; m < m_cur; ++m) {
-          const int32_t* src = acc_i32 + m * kBlockN;
-          float* a = acc + m * kBlockN;
-          const float xsc = xs[(m0 + m) * C1 + c1];
-          if (last) {
-            dequant_finalize<scalar_t, wscale_t>(
-                src, a, !first, xsc, wsc, bias_row,
-                out + (m0 + m) * N + n1 * kBlockN);
-          } else if (first) {
-            dequant_store<wscale_t>(src, a, xsc, wsc);
-          } else {
-            dequant_accum<wscale_t>(src, a, xsc, wsc);
-          }
-        }
-      }
+      ternary_tile_intrinsics<scalar_t, wscale_t>(
+          plan, luts, w + n1 * panel_bytes, ws + n1 * C1 * kBlockN,
+          xq + m0 * plan.C, xs + m0 * C1, m_cur, group_bytes, bias_row,
+          out + m0 * N + n1 * kBlockN, N, acc_i32, acc);
     }
   }
 }
@@ -442,7 +409,7 @@ void ternary_gemm_tiles(
 }  // namespace
 
 // Quantize [N, C] float weights to ternary and pack them into the layout the
-// LIBXSMM int2 microkernel expects.
+// int2 microkernel expects.
 //
 // Returns:
 //   packed [N/32, C/G, G/4, 8, 4] uint8 -- byte b packs the 4 output rows
@@ -565,27 +532,11 @@ void xsmm_ternary_gemm_into(
   const uint8_t* w_ptr = packed.data_ptr<uint8_t>();
   const bool half_ws = scales.scalar_type() == torch::kHalf;
 
-  // JIT lookup happens once per call, outside the parallel region.
   const int32_t m_full = static_cast<int32_t>(std::min<int64_t>(kBlockM, M));
   const int64_t m_blocks = (M + m_full - 1) / m_full;
   const int32_t m_rem = static_cast<int32_t>(M - (m_blocks - 1) * m_full);
 
-  const GemmKey key_full{
-      static_cast<int32_t>(kBlockN),
-      m_full,
-      static_cast<int32_t>(G),
-      static_cast<int32_t>(kBlockN),
-      static_cast<int32_t>(C),
-      static_cast<int32_t>(kBlockN)};
-
   TernaryGemmPlan plan;
-  plan.k_full = get_ternary_kernel(key_full);
-  plan.k_rem = plan.k_full;
-  if (m_rem != m_full) {
-    GemmKey key_rem = key_full;
-    key_rem.n = m_rem;
-    plan.k_rem = get_ternary_kernel(key_rem);
-  }
   plan.M = M;
   plan.N1 = N1;
   plan.C1 = C1;
@@ -671,5 +622,9 @@ void xsmm_ternary_reset_stats() {
 }
 
 std::string xsmm_target_arch() {
-  return std::string(libxsmm_get_target_arch());
+#ifdef XSMM_TERNARY_HAVE_X86
+  return ternary_have_simd() ? "avx2_vnni_int8" : "scalar";
+#else
+  return "scalar";
+#endif
 }

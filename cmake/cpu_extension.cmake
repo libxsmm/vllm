@@ -510,8 +510,6 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
 endif()
 
 if (ENABLE_X86_ISA)
-    include(${CMAKE_CURRENT_LIST_DIR}/external_projects/libxsmm.cmake)
-
     set(VLLM_EXT_SRC_SGL
         "csrc/cpu/sgl-kernels/conv.cpp"
         "csrc/cpu/sgl-kernels/gemm.cpp"
@@ -528,6 +526,7 @@ if (ENABLE_X86_ISA)
         "csrc/cpu/shm.cpp"
         "csrc/cpu/cpu_wna16.cpp"
         "csrc/cpu/xsmm_ternary.cpp"
+        "csrc/cpu/xsmm_ternary_micro.cpp"
         "csrc/cpu/cpu_fused_moe.cpp"
         "csrc/cpu/utils.cpp"
         "csrc/cpu/spec_decode_utils.cpp"
@@ -545,6 +544,7 @@ if (ENABLE_X86_ISA)
     set(VLLM_EXT_SRC_AVX2
         "csrc/cpu/sgl-kernels/fla.cpp"
         "csrc/cpu/xsmm_ternary.cpp"
+        "csrc/cpu/xsmm_ternary_micro.cpp"
         "csrc/cpu/cpu_fused_moe.cpp"
         "csrc/cpu/utils.cpp"
         "csrc/cpu/spec_decode_utils.cpp"
@@ -563,9 +563,9 @@ if (ENABLE_X86_ISA)
     message(STATUS "CPU extension (AVX512F) source files: ${VLLM_EXT_SRC_AVX512}")
     message(STATUS "CPU extension (AVX2) source files: ${VLLM_EXT_SRC_AVX2}")
 
-    set(_C_LIBS numa dnnl_ext xsmm)
-    set(_C_AVX512_LIBS numa dnnl_ext xsmm)
-    set(_C_AVX2_LIBS numa dnnl_ext xsmm)
+    set(_C_LIBS numa dnnl_ext)
+    set(_C_AVX512_LIBS numa dnnl_ext)
+    set(_C_AVX2_LIBS numa dnnl_ext)
 
     # AMX + AVX512F + AVX512BF16 + AVX512VNNI
     define_extension_target(
@@ -606,13 +606,9 @@ if (ENABLE_X86_ISA)
         WITH_SOABI
     )
 
-    # LIBXSMM-backed ternary (2-bit) GEMM.
-    # LIBXSMM_DEFAULT_CONFIG must match how the xsmm target itself is compiled,
-    # otherwise libxsmm_config.h pulls in the make-generated libxsmm_version.h.
+    # Ternary (2-bit) GEMM, implemented with AVX2 intrinsics.
     foreach(_tgt _C _C_AVX512 _C_AVX2)
-        target_compile_definitions(${_tgt} PRIVATE
-            VLLM_ENABLE_XSMM_TERNARY LIBXSMM_DEFAULT_CONFIG)
-        target_include_directories(${_tgt} PRIVATE ${VLLM_LIBXSMM_INCLUDE_DIR})
+        target_compile_definitions(${_tgt} PRIVATE VLLM_ENABLE_XSMM_TERNARY)
     endforeach()
 else()
     message(STATUS "CPU extension source files: ${VLLM_EXT_SRC}")

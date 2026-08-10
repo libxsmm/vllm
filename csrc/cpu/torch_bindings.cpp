@@ -197,6 +197,29 @@ void cpu_gemm_wna16(const torch::Tensor& input, const torch::Tensor& q_weight,
                     const std::optional<torch::Tensor>& bias,
                     const int64_t pack_factor, const std::string& isa_hint);
 
+#ifdef VLLM_ENABLE_XSMM_TERNARY
+std::tuple<torch::Tensor, torch::Tensor> xsmm_ternary_pack_weight(
+    const torch::Tensor& weight, int64_t group_size, bool half_scales);
+
+torch::Tensor xsmm_ternary_gemm(const torch::Tensor& input,
+                                const torch::Tensor& packed,
+                                const torch::Tensor& scales,
+                                const std::optional<torch::Tensor>& bias,
+                                int64_t group_size);
+
+void xsmm_ternary_gemm_out(const torch::Tensor& input,
+                           const torch::Tensor& packed,
+                           const torch::Tensor& scales,
+                           const std::optional<torch::Tensor>& bias,
+                           int64_t group_size, torch::Tensor& out);
+
+std::string xsmm_target_arch();
+
+std::tuple<int64_t, int64_t, int64_t, double> xsmm_ternary_stats();
+
+void xsmm_ternary_reset_stats();
+#endif
+
 void prepack_moe_weight(const torch::Tensor& weight,
                         torch::Tensor& packed_weight, const std::string& isa);
 
@@ -611,6 +634,29 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor scales, Tensor? zeros, Tensor? g_idx, Tensor? bias, SymInt "
       "pack_factor, str isa_hint) -> ()");
   ops.impl("cpu_gemm_wna16", torch::kCPU, &cpu_gemm_wna16);
+#endif
+
+  // LIBXSMM ternary (2-bit weight / int8 activation) GEMM
+#ifdef VLLM_ENABLE_XSMM_TERNARY
+  ops.def(
+      "xsmm_ternary_pack_weight(Tensor weight, SymInt group_size, "
+      "bool half_scales=False) -> (Tensor, Tensor)");
+  ops.impl("xsmm_ternary_pack_weight", torch::kCPU, &xsmm_ternary_pack_weight);
+  ops.def(
+      "xsmm_ternary_gemm(Tensor input, Tensor packed, Tensor scales, "
+      "Tensor? bias, SymInt group_size) -> Tensor");
+  ops.impl("xsmm_ternary_gemm", torch::kCPU, &xsmm_ternary_gemm);
+  ops.def(
+      "xsmm_ternary_gemm_out(Tensor input, Tensor packed, Tensor scales, "
+      "Tensor? bias, SymInt group_size, Tensor(a5!) out) -> ()");
+  ops.impl("xsmm_ternary_gemm_out", torch::kCPU, &xsmm_ternary_gemm_out);
+  ops.def("xsmm_target_arch() -> str");
+  // no tensor args, so it must not be pinned to a backend key
+  ops.impl("xsmm_target_arch", &xsmm_target_arch);
+  ops.def("xsmm_ternary_stats() -> (int, int, int, float)");
+  ops.impl("xsmm_ternary_stats", &xsmm_ternary_stats);
+  ops.def("xsmm_ternary_reset_stats() -> ()");
+  ops.impl("xsmm_ternary_reset_stats", &xsmm_ternary_reset_stats);
 #endif
 
   // fused moe

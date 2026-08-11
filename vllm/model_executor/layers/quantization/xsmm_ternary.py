@@ -54,6 +54,9 @@ XSMM_TERNARY_BLOCK_N = 32
 # Measured worth ~0.3% of a decode step, and unsafe under graph capture.
 _REUSE_OUTPUT_BUFFER = os.environ.get("VLLM_XSMM_TERNARY_REUSE_OUT", "0") == "1"
 
+# Escape hatch to compare the fused MoE op against the per-expert Python loop.
+_MOE_UNFUSED = os.environ.get("VLLM_XSMM_TERNARY_MOE_UNFUSED", "0") == "1"
+
 
 class XsmmTernaryConfig(QuantizationConfig):
     """Config for LIBXSMM ternary weight / int8 activation linear layers."""
@@ -534,9 +537,18 @@ class XsmmTernaryMoEMethod(FusedMoEMethodBase):
         w13_scale, w2_scale = layer.xsmm_w13_scale, layer.xsmm_w2_scale
 
         x2 = x.reshape(-1, x.shape[-1])
-        out = torch.zeros_like(x2)
         expert_map = layer.expert_map
         route_on_input = layer.apply_router_weight_on_input
+
+        # The fused op handles routing weights on the output only; expert
+        # parallelism would need the ids remapped first.
+        if not route_on_input and expert_map is None and not _MOE_UNFUSED:
+            out = torch.ops._C.xsmm_ternary_moe(
+                x2, topk_ids, topk_weights, w13, w13_scale, w2, w2_scale, g
+            )
+            return out.view_as(x)
+
+        out = torch.zeros_like(x2)
 
         for e in torch.unique(topk_ids).tolist():
             local_e = e if expert_map is None else int(expert_map[e])

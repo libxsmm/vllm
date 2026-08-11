@@ -216,6 +216,15 @@ void xsmm_ternary_gemm_out(const torch::Tensor& input,
 std::tuple<torch::Tensor, torch::Tensor> xsmm_int8_pack_weight(
     const torch::Tensor& weight, int64_t group_size, bool half_scales);
 
+torch::Tensor xsmm_ternary_moe(const torch::Tensor& input,
+                               const torch::Tensor& topk_ids,
+                               const torch::Tensor& topk_weights,
+                               const torch::Tensor& w13,
+                               const torch::Tensor& w13_scale,
+                               const torch::Tensor& w2,
+                               const torch::Tensor& w2_scale,
+                               int64_t group_size);
+
 torch::Tensor xsmm_int8_gemm(const torch::Tensor& input,
                              const torch::Tensor& packed,
                              const torch::Tensor& scales,
@@ -677,6 +686,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "xsmm_int8_gemm_out(Tensor input, Tensor packed, Tensor scales, "
       "Tensor? bias, SymInt group_size, Tensor(a5!) out) -> ()");
   ops.impl("xsmm_int8_gemm_out", torch::kCPU, &xsmm_int8_gemm_out);
+  ops.def(
+      "xsmm_ternary_moe(Tensor input, Tensor topk_ids, Tensor topk_weights, "
+      "Tensor w13, Tensor w13_scale, Tensor w2, Tensor w2_scale, "
+      "SymInt group_size) -> Tensor");
+  ops.impl("xsmm_ternary_moe", torch::kCPU, &xsmm_ternary_moe);
   ops.def("xsmm_target_arch() -> str");
   // no tensor args, so it must not be pinned to a backend key
   ops.impl("xsmm_target_arch", &xsmm_target_arch);

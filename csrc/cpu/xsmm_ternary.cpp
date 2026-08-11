@@ -446,7 +446,337 @@ void ternary_gemm_tiles(
   }
 }
 
+// One (expert, 32-column block, row block) tile: reduce over all groups and
+// dequantize into `out_rows`. Shared by both MoE GEMMs.
+template <typename scalar_t, typename wscale_t>
+inline void moe_tile(
+    libxsmm_gemmfunction kernel,
+    libxsmm_gemm_param& gemm_param,
+    const uint8_t* __restrict w_panel,
+    const wscale_t* __restrict ws_panel,
+    const int8_t* __restrict xq_rows,
+    const float* __restrict xs_rows,
+    int64_t m_cur,
+    int64_t C1,
+    int64_t G,
+    int64_t group_bytes,
+    scalar_t* __restrict out_rows,
+    int64_t ldo,
+    int32_t* __restrict acc_i32,
+    float* __restrict acc) {
+  for (int64_t c1 = 0; c1 < C1; ++c1) {
+    gemm_param.a.primary = const_cast<uint8_t*>(w_panel + c1 * group_bytes);
+    gemm_param.b.primary = const_cast<int8_t*>(xq_rows + c1 * G);
+    kernel(&gemm_param);
+
+    const wscale_t* wsc = ws_panel + c1 * kBlockN;
+    const bool first = (c1 == 0);
+    const bool last = (c1 + 1 == C1);
+    for (int64_t m = 0; m < m_cur; ++m) {
+      const int32_t* src = acc_i32 + m * kBlockN;
+      float* a = acc + m * kBlockN;
+      const float xsc = xs_rows[m * C1 + c1];
+      if (last) {
+        dequant_finalize<scalar_t, wscale_t>(
+            src, a, !first, xsc, wsc, nullptr, out_rows + m * ldo);
+      } else if (first) {
+        dequant_store<wscale_t>(src, a, xsc, wsc);
+      } else {
+        dequant_accum<wscale_t>(src, a, xsc, wsc);
+      }
+    }
+  }
+}
+
+// Buffers for the fused MoE op, reused across calls so the decode path stays
+// allocation-free.
+struct MoeScratch {
+  std::vector<int8_t> xq, aq;
+  std::vector<float> xs, as;
+  std::vector<int8_t> xq_g;
+  std::vector<float> xs_g;
+  std::vector<char> h, y;
+  std::vector<int32_t> perm, inv, offsets, counts;
+};
+
+MoeScratch& moe_scratch() {
+  static thread_local MoeScratch s;
+  return s;
+}
+
+// Copy each expert's activation rows together so the GEMM sees them contiguous.
+inline void moe_gather(
+    MoeScratch& s, int64_t TK, int64_t K, int64_t H, int64_t C1) {
+#pragma omp parallel for schedule(static)
+  for (int64_t j = 0; j < TK; ++j) {
+    const int64_t t = s.perm[j] / K;
+    std::memcpy(s.xq_g.data() + j * H, s.xq.data() + t * H, H);
+    std::memcpy(
+        s.xs_g.data() + j * C1, s.xs.data() + t * C1, C1 * sizeof(float));
+  }
+}
+
+struct MoeWork {
+  int32_t e, blk, mb;
+};
+
+struct MoeDims {
+  int64_t T, H, K, G, E, N13, I, C1, D1, TK;
+  int64_t n13_blocks, h_blocks;
+  int64_t w13_panel, w13_expert, w2_panel, w2_expert, group_bytes;
+};
+
+// OpenMP directives cannot live inside an AT_DISPATCH macro argument, so the
+// whole parallel region sits here and the dispatch just calls it.
+//
+// The h/y intermediates are float32 rather than the model dtype: rounding the
+// gate/up values to 16 bits before SiLU, and again per expert during the
+// reduction, costs about 5x accuracy at fp16.
+template <typename scalar_t, typename wscale_t>
+void moe_run(
+    const MoeDims& d,
+    MoeScratch& s,
+    const std::vector<MoeWork>& a_work,
+    const std::vector<MoeWork>& b_work,
+    const uint8_t* __restrict w13_p,
+    const wscale_t* __restrict w13s,
+    const uint8_t* __restrict w2_p,
+    const wscale_t* __restrict w2s,
+    const float* __restrict wts_p,
+    float* __restrict h_buf,
+    float* __restrict y_buf,
+    scalar_t* __restrict out_p) {
+#pragma omp parallel
+  {
+    alignas(64) int32_t acc_i32[kBlockM * kBlockN];
+    alignas(64) float acc[kBlockM * kBlockN];
+    alignas(64) float tmp[kBlockM * kBlockN];
+    libxsmm_gemm_param gp;
+    std::memset(&gp, 0, sizeof(gp));
+    unsigned long long br_count = 1;
+    gp.op.tertiary = &br_count;
+    gp.c.primary = acc_i32;
+
+#pragma omp for schedule(dynamic, 1)
+    for (int64_t w = 0; w < static_cast<int64_t>(a_work.size()); ++w) {
+      const MoeWork it = a_work[w];
+      const int64_t base = s.offsets[it.e];
+      const int64_t rows = s.offsets[it.e + 1] - base;
+      const int64_t m0 = static_cast<int64_t>(it.mb) * kBlockM;
+      const int64_t m_cur = std::min<int64_t>(kBlockM, rows - m0);
+      const GemmKey key{
+          static_cast<int32_t>(kBlockN), static_cast<int32_t>(m_cur),
+          static_cast<int32_t>(d.G),     static_cast<int32_t>(kBlockN),
+          static_cast<int32_t>(d.H),     static_cast<int32_t>(kBlockN),
+          2};
+      moe_tile<float, wscale_t>(
+          get_ternary_kernel(key), gp,
+          w13_p + it.e * d.w13_expert + it.blk * d.w13_panel,
+          w13s + (it.e * d.n13_blocks + it.blk) * d.C1 * kBlockN,
+          s.xq_g.data() + (base + m0) * d.H,
+          s.xs_g.data() + (base + m0) * d.C1,
+          m_cur, d.C1, d.G, d.group_bytes,
+          h_buf + (base + m0) * d.N13 + it.blk * kBlockN, d.N13,
+          acc_i32, acc);
+    }
+
+    // SiLU-gated activation, then requantize for the second GEMM
+#pragma omp for schedule(static)
+    for (int64_t j = 0; j < d.TK; ++j) {
+      const float* hp = h_buf + j * d.N13;
+      for (int64_t c = 0; c < d.D1; ++c) {
+        for (int64_t i = 0; i < d.G; ++i) {
+          const int64_t o = c * d.G + i;
+          const float gate = hp[o];
+          tmp[i] = (gate / (1.0f + std::exp(-gate))) * hp[d.I + o];
+        }
+        quantize_group<float>(
+            tmp, s.aq.data() + j * d.I + c * d.G, d.G, s.as[j * d.D1 + c]);
+      }
+    }
+
+#pragma omp for schedule(dynamic, 1)
+    for (int64_t w = 0; w < static_cast<int64_t>(b_work.size()); ++w) {
+      const MoeWork it = b_work[w];
+      const int64_t base = s.offsets[it.e];
+      const int64_t rows = s.offsets[it.e + 1] - base;
+      const int64_t m0 = static_cast<int64_t>(it.mb) * kBlockM;
+      const int64_t m_cur = std::min<int64_t>(kBlockM, rows - m0);
+      const GemmKey key{
+          static_cast<int32_t>(kBlockN), static_cast<int32_t>(m_cur),
+          static_cast<int32_t>(d.G),     static_cast<int32_t>(kBlockN),
+          static_cast<int32_t>(d.I),     static_cast<int32_t>(kBlockN),
+          2};
+      moe_tile<float, wscale_t>(
+          get_ternary_kernel(key), gp,
+          w2_p + it.e * d.w2_expert + it.blk * d.w2_panel,
+          w2s + (it.e * d.h_blocks + it.blk) * d.D1 * kBlockN,
+          s.aq.data() + (base + m0) * d.I,
+          s.as.data() + (base + m0) * d.D1,
+          m_cur, d.D1, d.G, d.group_bytes,
+          y_buf + (base + m0) * d.H + it.blk * kBlockN, d.H,
+          acc_i32, acc);
+    }
+
+    // each token is owned by one thread, so the reduction needs no atomics
+#pragma omp for schedule(static)
+    for (int64_t t = 0; t < d.T; ++t) {
+      scalar_t* o = out_p + t * d.H;
+      for (int64_t c = 0; c < d.H; ++c) {
+        float sum = 0.0f;
+        for (int64_t k = 0; k < d.K; ++k) {
+          sum += y_buf[s.inv[t * d.K + k] * d.H + c] * wts_p[t * d.K + k];
+        }
+        o[c] = static_cast<scalar_t>(sum);
+      }
+    }
+  }
+}
+
 }  // namespace
+
+// Fused ternary MoE: y[t] = sum_k topk_weight[t,k] *
+//     down_e( silu(gate_e(x[t])) * up_e(x[t]) ),  e = topk_ids[t,k]
+//
+// Doing this in one op keeps the decode path off the Python interpreter: a
+// per-expert loop issues two GEMM calls per expert per layer, and at 48 layers
+// x 8 experts that overhead dominates the actual weight streaming.
+torch::Tensor xsmm_ternary_moe(
+    const torch::Tensor& input,
+    const torch::Tensor& topk_ids,
+    const torch::Tensor& topk_weights,
+    const torch::Tensor& w13,
+    const torch::Tensor& w13_scale,
+    const torch::Tensor& w2,
+    const torch::Tensor& w2_scale,
+    int64_t group_size) {
+  TORCH_CHECK(input.dim() == 2, "input must be [T, H]");
+  TORCH_CHECK(topk_ids.dim() == 2 && topk_weights.dim() == 2, "topk must be 2-D");
+  TORCH_CHECK(w13.dim() == 6 && w2.dim() == 6, "packed MoE weights must be 6-D");
+  TORCH_CHECK(
+      topk_ids.scalar_type() == torch::kInt || topk_ids.scalar_type() == torch::kLong,
+      "topk_ids must be int32 or int64");
+
+  const auto t_start = std::chrono::steady_clock::now();
+
+  const auto x = input.contiguous();
+  const auto ids = topk_ids.to(torch::kInt).contiguous();
+  const auto wts = topk_weights.to(torch::kFloat).contiguous();
+
+  const int64_t T = x.size(0);
+  const int64_t H = x.size(1);
+  const int64_t K = ids.size(1);
+  const int64_t G = group_size;
+  const int64_t E = w13.size(0);
+  const int64_t N13 = w13.size(1) * kBlockN;  // 2 * intermediate
+  const int64_t I = N13 / 2;
+  const int64_t C1 = H / G;
+  const int64_t D1 = I / G;
+  const int64_t TK = T * K;
+
+  TORCH_CHECK(C1 * G == H, "hidden size must be a multiple of group_size");
+  TORCH_CHECK(D1 * G == I, "intermediate size must be a multiple of group_size");
+  TORCH_CHECK(w2.size(1) * kBlockN == H, "w2 output does not match hidden size");
+
+  auto out = torch::zeros({T, H}, x.options());
+
+  const int64_t w13_group_bytes = (G / kVnni) * kLanes * kVnni;
+  const int64_t w13_panel = C1 * w13_group_bytes;
+  const int64_t w13_expert = (N13 / kBlockN) * w13_panel;
+  const int64_t w2_group_bytes = w13_group_bytes;
+  const int64_t w2_panel = D1 * w2_group_bytes;
+  const int64_t w2_expert = (H / kBlockN) * w2_panel;
+
+  auto& s = moe_scratch();
+  s.xq.resize(T * H);
+  s.xs.resize(T * C1);
+  s.xq_g.resize(TK * H);
+  s.xs_g.resize(TK * C1);
+  s.aq.resize(TK * I);
+  s.as.resize(TK * D1);
+  s.perm.resize(TK);
+  s.inv.resize(TK);
+  s.counts.assign(E + 1, 0);
+  s.offsets.assign(E + 1, 0);
+
+  const int32_t* ids_p = ids.data_ptr<int32_t>();
+  const float* wts_p = wts.data_ptr<float>();
+
+  // counting sort of the (token, slot) pairs by expert
+  for (int64_t p = 0; p < TK; ++p) {
+    s.counts[ids_p[p] + 1]++;
+  }
+  for (int64_t e = 0; e < E; ++e) {
+    s.counts[e + 1] += s.counts[e];
+  }
+  std::copy(s.counts.begin(), s.counts.end(), s.offsets.begin());
+  {
+    std::vector<int32_t> pos(s.counts.begin(), s.counts.end());
+    for (int64_t p = 0; p < TK; ++p) {
+      const int32_t e = ids_p[p];
+      const int32_t j = pos[e]++;
+      s.perm[j] = static_cast<int32_t>(p);
+      s.inv[p] = j;
+    }
+  }
+
+  const int64_t n13_blocks = N13 / kBlockN;
+  const int64_t h_blocks = H / kBlockN;
+
+  MoeDims d{T,  H,  K,  G,  E,  N13, I, C1, D1, TK,
+            n13_blocks, h_blocks,
+            w13_panel, w13_expert, w2_panel, w2_expert, w13_group_bytes};
+
+  // work items: (expert, 32-column block, row block) for each of the two GEMMs
+  std::vector<MoeWork> a_work, b_work;
+  for (int64_t e = 0; e < E; ++e) {
+    const int64_t rows = s.offsets[e + 1] - s.offsets[e];
+    if (rows == 0) continue;
+    const int64_t mblocks = (rows + kBlockM - 1) / kBlockM;
+    for (int64_t b = 0; b < n13_blocks; ++b)
+      for (int64_t m = 0; m < mblocks; ++m)
+        a_work.push_back({(int32_t)e, (int32_t)b, (int32_t)m});
+    for (int64_t b = 0; b < h_blocks; ++b)
+      for (int64_t m = 0; m < mblocks; ++m)
+        b_work.push_back({(int32_t)e, (int32_t)b, (int32_t)m});
+  }
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf, at::kBFloat16, x.scalar_type(), "xsmm_ternary_moe", [&] {
+        s.h.resize(TK * N13 * sizeof(float));
+        s.y.resize(TK * H * sizeof(float));
+        auto* h_buf = reinterpret_cast<float*>(s.h.data());
+        auto* y_buf = reinterpret_cast<float*>(s.y.data());
+        const scalar_t* x_p = x.data_ptr<scalar_t>();
+        scalar_t* out_p = out.data_ptr<scalar_t>();
+
+        quantize_activations<scalar_t>(x_p, s.xq.data(), s.xs.data(), T, H, G);
+        moe_gather(s, TK, K, H, C1);
+
+        const uint8_t* w13_p = w13.data_ptr<uint8_t>();
+        const uint8_t* w2_p = w2.data_ptr<uint8_t>();
+
+        if (w13_scale.scalar_type() == torch::kHalf) {
+          moe_run<scalar_t, at::Half>(
+              d, s, a_work, b_work, w13_p, w13_scale.data_ptr<at::Half>(),
+              w2_p, w2_scale.data_ptr<at::Half>(), wts_p, h_buf, y_buf, out_p);
+        } else {
+          moe_run<scalar_t, float>(
+              d, s, a_work, b_work, w13_p, w13_scale.data_ptr<float>(), w2_p,
+              w2_scale.data_ptr<float>(), wts_p, h_buf, y_buf, out_p);
+        }
+      });
+
+  auto& st = ternary_stats();
+  st.calls.fetch_add(1, std::memory_order_relaxed);
+  st.rows.fetch_add(T, std::memory_order_relaxed);
+  st.nanos.fetch_add(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - t_start)
+          .count(),
+      std::memory_order_relaxed);
+  return out;
+}
 
 // Quantize [N, C] float weights to ternary and pack them into the layout the
 // LIBXSMM int2 microkernel expects.

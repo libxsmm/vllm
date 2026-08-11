@@ -538,6 +538,8 @@ void moe_run(
     MoeScratch& s,
     const std::vector<MoeWork>& a_work,
     const std::vector<MoeWork>& b_work,
+    const libxsmm_gemmfunction* __restrict ka,
+    const libxsmm_gemmfunction* __restrict kb,
     const uint8_t* __restrict w13_p,
     const wscale_t* __restrict w13s,
     const uint8_t* __restrict w2_p,
@@ -564,13 +566,8 @@ void moe_run(
       const int64_t rows = s.offsets[it.e + 1] - base;
       const int64_t m0 = static_cast<int64_t>(it.mb) * kBlockM;
       const int64_t m_cur = std::min<int64_t>(kBlockM, rows - m0);
-      const GemmKey key{
-          static_cast<int32_t>(kBlockN), static_cast<int32_t>(m_cur),
-          static_cast<int32_t>(d.G),     static_cast<int32_t>(kBlockN),
-          static_cast<int32_t>(d.H),     static_cast<int32_t>(kBlockN),
-          2};
       moe_tile<float, wscale_t>(
-          get_ternary_kernel(key), gp,
+          ka[m_cur], gp,
           w13_p + it.e * d.w13_expert + it.blk * d.w13_panel,
           w13s + (it.e * d.n13_blocks + it.blk) * d.C1 * kBlockN,
           s.xq_g.data() + (base + m0) * d.H,
@@ -602,13 +599,8 @@ void moe_run(
       const int64_t rows = s.offsets[it.e + 1] - base;
       const int64_t m0 = static_cast<int64_t>(it.mb) * kBlockM;
       const int64_t m_cur = std::min<int64_t>(kBlockM, rows - m0);
-      const GemmKey key{
-          static_cast<int32_t>(kBlockN), static_cast<int32_t>(m_cur),
-          static_cast<int32_t>(d.G),     static_cast<int32_t>(kBlockN),
-          static_cast<int32_t>(d.I),     static_cast<int32_t>(kBlockN),
-          2};
       moe_tile<float, wscale_t>(
-          get_ternary_kernel(key), gp,
+          kb[m_cur], gp,
           w2_p + it.e * d.w2_expert + it.blk * d.w2_panel,
           w2s + (it.e * d.h_blocks + it.blk) * d.D1 * kBlockN,
           s.aq.data() + (base + m0) * d.I,
@@ -729,9 +721,11 @@ torch::Tensor xsmm_ternary_moe(
 
   // work items: (expert, 32-column block, row block) for each of the two GEMMs
   std::vector<MoeWork> a_work, b_work;
+  int64_t max_rows = 0;
   for (int64_t e = 0; e < E; ++e) {
     const int64_t rows = s.offsets[e + 1] - s.offsets[e];
     if (rows == 0) continue;
+    max_rows = std::max(max_rows, rows);
     const int64_t mblocks = (rows + kBlockM - 1) / kBlockM;
     for (int64_t b = 0; b < n13_blocks; ++b)
       for (int64_t m = 0; m < mblocks; ++m)
@@ -740,6 +734,27 @@ torch::Tensor xsmm_ternary_moe(
       for (int64_t m = 0; m < mblocks; ++m)
         b_work.push_back({(int32_t)e, (int32_t)b, (int32_t)m});
   }
+
+  // Resolve the JIT kernels up front: the lookup takes a process-global mutex,
+  // so doing it per work item would serialize every thread.
+  std::vector<libxsmm_gemmfunction> ka(kBlockM + 1, nullptr);
+  std::vector<libxsmm_gemmfunction> kb(kBlockM + 1, nullptr);
+  for (int64_t e = 0; e < E; ++e) {
+    const int64_t rows = s.offsets[e + 1] - s.offsets[e];
+    if (rows == 0) continue;
+    for (int64_t m0 = 0; m0 < rows; m0 += kBlockM) {
+      const int64_t m_cur = std::min<int64_t>(kBlockM, rows - m0);
+      if (ka[m_cur] == nullptr) {
+        ka[m_cur] = get_ternary_kernel(
+            {(int32_t)kBlockN, (int32_t)m_cur, (int32_t)G, (int32_t)kBlockN,
+             (int32_t)H, (int32_t)kBlockN, 2});
+        kb[m_cur] = get_ternary_kernel(
+            {(int32_t)kBlockN, (int32_t)m_cur, (int32_t)G, (int32_t)kBlockN,
+             (int32_t)I, (int32_t)kBlockN, 2});
+      }
+    }
+  }
+  (void)max_rows;
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::kHalf, at::kBFloat16, x.scalar_type(), "xsmm_ternary_moe", [&] {
@@ -758,12 +773,14 @@ torch::Tensor xsmm_ternary_moe(
 
         if (w13_scale.scalar_type() == torch::kHalf) {
           moe_run<scalar_t, at::Half>(
-              d, s, a_work, b_work, w13_p, w13_scale.data_ptr<at::Half>(),
-              w2_p, w2_scale.data_ptr<at::Half>(), wts_p, h_buf, y_buf, out_p);
+              d, s, a_work, b_work, ka.data(), kb.data(), w13_p,
+              w13_scale.data_ptr<at::Half>(), w2_p,
+              w2_scale.data_ptr<at::Half>(), wts_p, h_buf, y_buf, out_p);
         } else {
           moe_run<scalar_t, float>(
-              d, s, a_work, b_work, w13_p, w13_scale.data_ptr<float>(), w2_p,
-              w2_scale.data_ptr<float>(), wts_p, h_buf, y_buf, out_p);
+              d, s, a_work, b_work, ka.data(), kb.data(), w13_p,
+              w13_scale.data_ptr<float>(), w2_p, w2_scale.data_ptr<float>(),
+              wts_p, h_buf, y_buf, out_p);
         }
       });
 
@@ -1114,4 +1131,24 @@ void xsmm_ternary_reset_stats() {
 
 std::string xsmm_target_arch() {
   return std::string(libxsmm_get_target_arch());
+}
+
+// Ask for 2 MiB pages over a weight buffer. A multi-GiB model mapped with 4 KiB
+// pages exceeds the L2 TLB by orders of magnitude, so streaming the weights
+// costs a page walk per access; the node has THP on `madvise` defrag, which
+// means large mappings are not promoted unless asked. Call before filling, so
+// the pages fault in already huge.
+void xsmm_hugepage_advise(torch::Tensor& t) {
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+  constexpr uintptr_t kHuge = 2u << 20;
+  const auto start = reinterpret_cast<uintptr_t>(t.data_ptr());
+  const size_t bytes = t.numel() * t.element_size();
+  const uintptr_t aligned = (start + kHuge - 1) & ~(kHuge - 1);
+  if (bytes > aligned - start + kHuge) {
+    madvise(
+        reinterpret_cast<void*>(aligned),
+        (bytes - (aligned - start)) & ~(kHuge - 1),
+        MADV_HUGEPAGE);
+  }
+#endif
 }

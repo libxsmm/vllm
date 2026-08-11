@@ -56,6 +56,7 @@ _REUSE_OUTPUT_BUFFER = os.environ.get("VLLM_XSMM_TERNARY_REUSE_OUT", "0") == "1"
 
 # Escape hatch to compare the fused MoE op against the per-expert Python loop.
 _MOE_UNFUSED = os.environ.get("VLLM_XSMM_TERNARY_MOE_UNFUSED", "0") == "1"
+_MOE_HUGEPAGE = os.environ.get("VLLM_XSMM_TERNARY_HUGEPAGE", "0") == "1"
 
 
 class XsmmTernaryConfig(QuantizationConfig):
@@ -379,10 +380,11 @@ class XsmmTernaryMoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ) -> None:
         g = self.group_size
-        if self.moe.is_act_and_mul:
-            w13_up_dim = 2 * intermediate_size_per_partition
-        else:
-            w13_up_dim = intermediate_size_per_partition
+        w13_up_dim = (
+            2 * intermediate_size_per_partition
+            if self.moe.is_act_and_mul
+            else intermediate_size_per_partition
+        )
 
         ok = _can_pack(w13_up_dim, hidden_size, g) and _can_pack(
             hidden_size, intermediate_size_per_partition, g
@@ -394,6 +396,14 @@ class XsmmTernaryMoEMethod(FusedMoEMethodBase):
                 f"compatible with the ternary kernel (need N % "
                 f"{XSMM_TERNARY_BLOCK_N} == 0 and K % {g} == 0)"
             )
+
+        if self.quant_config.pre_packed:
+            self._create_prepacked(
+                layer, num_experts, hidden_size,
+                intermediate_size_per_partition, w13_up_dim, g,
+                extra_weight_attrs,
+            )
+            return
 
         w13 = _empty_packed(num_experts, w13_up_dim, hidden_size, g)
         w13_scale = _empty_scales(
@@ -409,6 +419,13 @@ class XsmmTernaryMoEMethod(FusedMoEMethodBase):
             g,
             self.quant_config.scale_dtype,
         )
+        # NOTE: madvise(MADV_HUGEPAGE) here made things worse on this node --
+        # defrag is set to `madvise`, so faults on the advised range do
+        # synchronous compaction. It reached only 5.5 of 56 GiB of huge pages
+        # and cost ~35% throughput. Opt in explicitly if defrag is `defer`.
+        if _MOE_HUGEPAGE:
+            for t in (w13, w2):
+                torch.ops._C.xsmm_hugepage_advise(t)
 
         # The expert params mapping targets the names "w13_weight"/"w2_weight",
         # so the packed tensors have to use them; the scales ride along on the
@@ -456,8 +473,90 @@ class XsmmTernaryMoEMethod(FusedMoEMethodBase):
             return True
         return None
 
+    def _create_prepacked(
+        self,
+        layer: RoutedExperts,
+        num_experts: int,
+        hidden_size: int,
+        inter: int,
+        w13_up_dim: int,
+        g: int,
+        extra_weight_attrs: dict,
+    ) -> None:
+        """Load an already-packed checkpoint.
+
+        Avoids reading (and page-caching) the 16-bit weights at all, which for
+        Qwen3-MoE-235B is 438 GB of I/O whose leftover page cache then evicts
+        the model itself.
+        """
+        scale_dtype = self.quant_config.scale_dtype
+
+        def _packed(n, k):
+            return torch.nn.Parameter(
+                torch.empty(
+                    (num_experts, *_packed_shape(n, k, g)), dtype=torch.uint8
+                ),
+                requires_grad=False,
+            )
+
+        def _scale(n, k):
+            # as written by the packer: [N, C/G], reshaped after loading
+            return torch.nn.Parameter(
+                torch.empty(num_experts, n, k // g, dtype=scale_dtype),
+                requires_grad=False,
+            )
+
+        params = {
+            "w13_weight_packed": _packed(w13_up_dim, hidden_size),
+            "w13_weight_scale": _scale(w13_up_dim, hidden_size),
+            "w2_weight_packed": _packed(hidden_size, inter),
+            "w2_weight_scale": _scale(hidden_size, inter),
+        }
+        attrs = dict(extra_weight_attrs)
+        attrs["weight_loader"] = self._load_prepacked
+        for name, p in params.items():
+            layer.register_parameter(name, p)
+            set_weight_attrs(p, attrs)
+
+    def _load_prepacked(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+        return_success: bool = False,
+    ):
+        if shard_id == "w2":
+            param.data[expert_id].copy_(loaded_weight)
+        else:
+            # gate occupies the first half of dim 0, up the second; true for
+            # both the packed tensor (blocked by 32) and the [N, C/G] scales
+            half = param.shape[1] // 2
+            off = 0 if shard_id == "w1" else half
+            param.data[expert_id, off : off + half].copy_(loaded_weight)
+        if return_success:
+            return True
+        return None
+
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
-        return
+        if not self.quant_config.pre_packed:
+            return
+
+        for tag in ("w13", "w2"):
+            packed = getattr(layer, f"{tag}_weight_packed").data
+            scale = getattr(layer, f"{tag}_weight_scale").data
+            e, blocks, groups = packed.shape[0], packed.shape[1], packed.shape[2]
+            # [E, N, C/G] -> [E, N/32, C/G, 32], the layout the kernel indexes
+            scale = (
+                scale.view(e, blocks, XSMM_TERNARY_BLOCK_N, groups)
+                .permute(0, 1, 3, 2)
+                .contiguous()
+            )
+            layer.register_parameter(f"{tag}_weight_packed", None)
+            layer.register_parameter(f"{tag}_weight_scale", None)
+            setattr(layer, f"{tag}_weight", packed)
+            setattr(layer, f"xsmm_{tag}_scale", scale)
 
     def get_fused_moe_quant_config(
         self, layer: RoutedExperts

@@ -239,6 +239,8 @@ void xsmm_int8_gemm_out(const torch::Tensor& input,
 
 std::string xsmm_target_arch();
 
+void xsmm_hugepage_advise(torch::Tensor& t);
+
 std::tuple<int64_t, int64_t, int64_t, double> xsmm_ternary_stats();
 
 void xsmm_ternary_reset_stats();
@@ -694,6 +696,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("xsmm_target_arch() -> str");
   // no tensor args, so it must not be pinned to a backend key
   ops.impl("xsmm_target_arch", &xsmm_target_arch);
+  ops.def("xsmm_hugepage_advise(Tensor(a!) t) -> ()");
+  ops.impl("xsmm_hugepage_advise", torch::kCPU, &xsmm_hugepage_advise);
   ops.def("xsmm_ternary_stats() -> (int, int, int, float)");
   ops.impl("xsmm_ternary_stats", &xsmm_ternary_stats);
   ops.def("xsmm_ternary_reset_stats() -> ()");

@@ -50,10 +50,12 @@ static_assert(kBlockN == kLanes * kPack, "N block must be lanes x pack factor");
 
 struct GemmKey {
   int32_t m, n, k, lda, ldb, ldc;
+  // 2 = int2 interleaved weights, 8 = plain VNNI4 int8 weights
+  int32_t wbits;
 
   bool operator==(const GemmKey& o) const {
     return m == o.m && n == o.n && k == o.k && lda == o.lda && ldb == o.ldb &&
-           ldc == o.ldc;
+           ldc == o.ldc && wbits == o.wbits;
   }
 };
 
@@ -95,16 +97,17 @@ libxsmm_gemmfunction get_ternary_kernel(const GemmKey& key) {
   shape.out_type = LIBXSMM_DATATYPE_I32;
   shape.comp_type = LIBXSMM_DATATYPE_I32;
 
+  const libxsmm_bitfield int2_flag =
+      (key.wbits == 2) ? LIBXSMM_GEMM_FLAG_INTERPRETE_A_AS_INT2_VNNI4_INTLV : 0;
   const libxsmm_bitfield flags = LIBXSMM_GEMM_FLAGS('N', 'N') |
-      LIBXSMM_GEMM_FLAG_VNNI_A |
-      LIBXSMM_GEMM_FLAG_INTERPRETE_A_AS_INT2_VNNI4_INTLV |
-      LIBXSMM_GEMM_FLAG_BETA_0;
+      LIBXSMM_GEMM_FLAG_VNNI_A | int2_flag | LIBXSMM_GEMM_FLAG_BETA_0;
 
   libxsmm_gemm_batch_reduce_config brconfig;
   std::memset(&brconfig, 0, sizeof(brconfig));
   brconfig.br_type = LIBXSMM_GEMM_BATCH_REDUCE_STRIDE;
-  // 4 ternary values per byte
-  brconfig.br_stride_a_hint = key.k * key.lda / kPack;
+  // int2 packs 4 ternary values per byte; int8 is one byte per value
+  brconfig.br_stride_a_hint =
+      (key.wbits == 2) ? key.k * key.lda / kPack : key.k * key.lda;
   brconfig.br_stride_b_hint = key.k;
   brconfig.br_unroll_hint = 1;
 
@@ -112,13 +115,15 @@ libxsmm_gemmfunction get_ternary_kernel(const GemmKey& key) {
       libxsmm_dispatch_brgemm(shape, flags, /*prefetch=*/0, brconfig);
   TORCH_CHECK(
       fn != nullptr,
-      "LIBXSMM failed to JIT an int2xint8 kernel (m=",
+      "LIBXSMM failed to JIT an int",
+      key.wbits,
+      "xint8 kernel (m=",
       key.m,
       " n=",
       key.n,
       " k=",
       key.k,
-      "). The AVX2/SRF int2 microkernel requires AVX-VNNI-INT8 and "
+      "). The AVX2/SRF microkernel requires AVX-VNNI-INT8 and "
       "AVX-NE-CONVERT; libxsmm target arch is '",
       libxsmm_get_target_arch(),
       "'.");
@@ -341,6 +346,8 @@ struct TernaryGemmPlan {
   libxsmm_gemmfunction k_rem;
   int64_t M, N1, C1, C, G;
   int64_t m_full, m_blocks, m_rem;
+  // bytes of packed weight per (32-column block, group)
+  int64_t group_bytes;
 };
 
 // Counters so the GEMM cost can be isolated from the rest of the model during a
@@ -380,7 +387,7 @@ void ternary_gemm_tiles(
     const scalar_t* __restrict bias,
     scalar_t* __restrict out) {
   const int64_t N = plan.N1 * kBlockN;
-  const int64_t group_bytes = (plan.G / kVnni) * kLanes * kVnni;
+  const int64_t group_bytes = plan.group_bytes;
   const int64_t panel_bytes = plan.C1 * group_bytes;
   const int64_t n_work = plan.N1 * plan.m_blocks;
   const int64_t C1 = plan.C1;
@@ -516,16 +523,94 @@ std::tuple<torch::Tensor, torch::Tensor> xsmm_ternary_pack_weight(
   return {packed, half_scales ? scales.to(torch::kHalf) : scales};
 }
 
+// Quantize [N, C] float weights to symmetric per-(row, group) int8 and pack
+// them as plain VNNI4 -- the same tiling as the int2 path but one byte per
+// weight, so 32 rows sit where the int2 layout puts 8 lanes x 4 bit-planes.
+//
+// Returns:
+//   packed [N/32, C/G, G/4, 32, 4] int8
+//   scales [N/32, C/G, 32] float or half -- absmax/127 per (output row, group)
+std::tuple<torch::Tensor, torch::Tensor> xsmm_int8_pack_weight(
+    const torch::Tensor& weight,
+    int64_t group_size,
+    bool half_scales) {
+  TORCH_CHECK(weight.dim() == 2, "weight must be 2-D [N, C]");
+  const int64_t N = weight.size(0);
+  const int64_t C = weight.size(1);
+  const int64_t G = group_size;
+
+  TORCH_CHECK(N % kBlockN == 0, "N (", N, ") must be a multiple of ", kBlockN);
+  TORCH_CHECK(G % kVnni == 0, "group_size (", G, ") must be a multiple of ", kVnni);
+  TORCH_CHECK(C % G == 0, "C (", C, ") must be a multiple of group_size (", G, ")");
+
+  const auto w = weight.to(torch::kFloat).contiguous();
+  const int64_t N1 = N / kBlockN;
+  const int64_t C1 = C / G;
+  const int64_t C2 = G / kVnni;
+
+  auto packed = torch::empty(
+      {N1, C1, C2, kBlockN, kVnni}, weight.options().dtype(torch::kChar));
+  auto scales =
+      torch::empty({N1, C1, kBlockN}, weight.options().dtype(torch::kFloat));
+
+  const float* w_ptr = w.data_ptr<float>();
+  int8_t* p_ptr = packed.data_ptr<int8_t>();
+  float* s_ptr = scales.data_ptr<float>();
+
+  const int64_t tiles = N1 * C1;
+
+#pragma omp parallel for schedule(dynamic, 1)
+  for (int64_t t = 0; t < tiles; ++t) {
+    const int64_t n1 = t / C1;
+    const int64_t c1 = t % C1;
+
+    float* tile_scales = s_ptr + t * kBlockN;
+    float inv_scale[kBlockN];
+
+    for (int64_t r = 0; r < kBlockN; ++r) {
+      const float* row = w_ptr + (n1 * kBlockN + r) * C + c1 * G;
+      float amax = 0.0f;
+      for (int64_t j = 0; j < G; ++j) {
+        amax = std::max(amax, std::fabs(row[j]));
+      }
+      const float scale = std::max(amax / 127.0f, 1e-12f);
+      tile_scales[r] = scale;
+      inv_scale[r] = 1.0f / scale;
+    }
+
+    int8_t* tile = p_ptr + t * C2 * kBlockN * kVnni;
+    for (int64_t c2 = 0; c2 < C2; ++c2) {
+      for (int64_t r = 0; r < kBlockN; ++r) {
+        for (int64_t c3 = 0; c3 < kVnni; ++c3) {
+          const int64_t c = c1 * G + c2 * kVnni + c3;
+          const float v = w_ptr[(n1 * kBlockN + r) * C + c] * inv_scale[r];
+          const float q = std::nearbyintf(v);
+          tile[(c2 * kBlockN + r) * kVnni + c3] = static_cast<int8_t>(
+              std::min(127.0f, std::max(-127.0f, q)));
+        }
+      }
+    }
+  }
+
+  return {packed, half_scales ? scales.to(torch::kHalf) : scales};
+}
+
 // y = x @ dequant(packed)^T (+ bias), written into `out`.
-void xsmm_ternary_gemm_into(
+// wbits selects the weight encoding: 2 = int2 interleaved, 8 = VNNI4 int8.
+static void quant_gemm_into(
     const torch::Tensor& input,
     const torch::Tensor& packed,
     const torch::Tensor& scales,
     const std::optional<torch::Tensor>& bias,
     int64_t group_size,
-    torch::Tensor& out) {
+    torch::Tensor& out,
+    int wbits) {
   TORCH_CHECK(input.dim() >= 2, "input must have at least 2 dims");
-  TORCH_CHECK(packed.dim() == 5 && packed.scalar_type() == torch::kUInt8);
+  TORCH_CHECK(packed.dim() == 5, "packed weight must be 5-D");
+  TORCH_CHECK(
+      packed.scalar_type() ==
+          (wbits == 2 ? torch::kUInt8 : torch::kChar),
+      "packed weight dtype does not match the ", wbits, "-bit layout");
   TORCH_CHECK(
       scales.dim() == 3 &&
           (scales.scalar_type() == torch::kFloat ||
@@ -562,7 +647,8 @@ void xsmm_ternary_gemm_into(
   int8_t* xq_ptr = scratch.xq.data();
   float* xs_ptr = scratch.xs.data();
 
-  const uint8_t* w_ptr = packed.data_ptr<uint8_t>();
+  const uint8_t* w_ptr =
+      reinterpret_cast<const uint8_t*>(packed.const_data_ptr());
   const bool half_ws = scales.scalar_type() == torch::kHalf;
 
   // JIT lookup happens once per call, outside the parallel region.
@@ -576,7 +662,8 @@ void xsmm_ternary_gemm_into(
       static_cast<int32_t>(G),
       static_cast<int32_t>(kBlockN),
       static_cast<int32_t>(C),
-      static_cast<int32_t>(kBlockN)};
+      static_cast<int32_t>(kBlockN),
+      wbits};
 
   TernaryGemmPlan plan;
   plan.k_full = get_ternary_kernel(key_full);
@@ -594,6 +681,8 @@ void xsmm_ternary_gemm_into(
   plan.m_full = m_full;
   plan.m_blocks = m_blocks;
   plan.m_rem = m_rem;
+  plan.group_bytes =
+      (G / kVnni) * (wbits == 2 ? kLanes : kBlockN) * kVnni;
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::kHalf, at::kBFloat16, x.scalar_type(), "xsmm_ternary_gemm", [&] {
@@ -638,7 +727,7 @@ torch::Tensor xsmm_ternary_gemm(
   auto out_sizes = input.sizes().vec();
   out_sizes.back() = packed.size(0) * kBlockN;
   auto out = torch::empty(out_sizes, input.options());
-  xsmm_ternary_gemm_into(input, packed, scales, bias, group_size, out);
+  quant_gemm_into(input, packed, scales, bias, group_size, out, /*wbits=*/2);
   return out;
 }
 
@@ -649,7 +738,30 @@ void xsmm_ternary_gemm_out(
     const std::optional<torch::Tensor>& bias,
     int64_t group_size,
     torch::Tensor& out) {
-  xsmm_ternary_gemm_into(input, packed, scales, bias, group_size, out);
+  quant_gemm_into(input, packed, scales, bias, group_size, out, /*wbits=*/2);
+}
+
+torch::Tensor xsmm_int8_gemm(
+    const torch::Tensor& input,
+    const torch::Tensor& packed,
+    const torch::Tensor& scales,
+    const std::optional<torch::Tensor>& bias,
+    int64_t group_size) {
+  auto out_sizes = input.sizes().vec();
+  out_sizes.back() = packed.size(0) * kBlockN;
+  auto out = torch::empty(out_sizes, input.options());
+  quant_gemm_into(input, packed, scales, bias, group_size, out, /*wbits=*/8);
+  return out;
+}
+
+void xsmm_int8_gemm_out(
+    const torch::Tensor& input,
+    const torch::Tensor& packed,
+    const torch::Tensor& scales,
+    const std::optional<torch::Tensor>& bias,
+    int64_t group_size,
+    torch::Tensor& out) {
+  quant_gemm_into(input, packed, scales, bias, group_size, out, /*wbits=*/8);
 }
 
 // (calls, rows, weight_bytes, seconds) accumulated since the last reset.

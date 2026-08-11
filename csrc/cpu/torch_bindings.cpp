@@ -213,6 +213,21 @@ void xsmm_ternary_gemm_out(const torch::Tensor& input,
                            const std::optional<torch::Tensor>& bias,
                            int64_t group_size, torch::Tensor& out);
 
+std::tuple<torch::Tensor, torch::Tensor> xsmm_int8_pack_weight(
+    const torch::Tensor& weight, int64_t group_size, bool half_scales);
+
+torch::Tensor xsmm_int8_gemm(const torch::Tensor& input,
+                             const torch::Tensor& packed,
+                             const torch::Tensor& scales,
+                             const std::optional<torch::Tensor>& bias,
+                             int64_t group_size);
+
+void xsmm_int8_gemm_out(const torch::Tensor& input,
+                        const torch::Tensor& packed,
+                        const torch::Tensor& scales,
+                        const std::optional<torch::Tensor>& bias,
+                        int64_t group_size, torch::Tensor& out);
+
 std::string xsmm_target_arch();
 
 std::tuple<int64_t, int64_t, int64_t, double> xsmm_ternary_stats();
@@ -650,6 +665,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "xsmm_ternary_gemm_out(Tensor input, Tensor packed, Tensor scales, "
       "Tensor? bias, SymInt group_size, Tensor(a5!) out) -> ()");
   ops.impl("xsmm_ternary_gemm_out", torch::kCPU, &xsmm_ternary_gemm_out);
+  ops.def(
+      "xsmm_int8_pack_weight(Tensor weight, SymInt group_size, "
+      "bool half_scales=False) -> (Tensor, Tensor)");
+  ops.impl("xsmm_int8_pack_weight", torch::kCPU, &xsmm_int8_pack_weight);
+  ops.def(
+      "xsmm_int8_gemm(Tensor input, Tensor packed, Tensor scales, "
+      "Tensor? bias, SymInt group_size) -> Tensor");
+  ops.impl("xsmm_int8_gemm", torch::kCPU, &xsmm_int8_gemm);
+  ops.def(
+      "xsmm_int8_gemm_out(Tensor input, Tensor packed, Tensor scales, "
+      "Tensor? bias, SymInt group_size, Tensor(a5!) out) -> ()");
+  ops.impl("xsmm_int8_gemm_out", torch::kCPU, &xsmm_int8_gemm_out);
   ops.def("xsmm_target_arch() -> str");
   // no tensor args, so it must not be pinned to a backend key
   ops.impl("xsmm_target_arch", &xsmm_target_arch);

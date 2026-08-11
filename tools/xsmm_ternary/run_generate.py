@@ -27,6 +27,15 @@ def main() -> None:
                    help="wrap prompts in the model's chat template (instruct models)")
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--enforce-eager", action="store_true", default=True)
+    p.add_argument("--lm-head-mode", choices=("ternary", "skip", "int8"),
+                   default=None,
+                   help="override how lm_head is quantized: keep it ternary, "
+                        "leave it dense, or quantize it to int8 at load time")
+    p.add_argument("--lm-head-group-size", type=int, default=None,
+                   help="group size for --lm-head-mode int8 (default: the "
+                        "checkpoint's group_size)")
+    # on the CPU backend this is the fraction of host RAM vLLM reserves
+    p.add_argument("--gpu-memory-utilization", type=float, default=None)
     args = p.parse_args()
 
     llm_kwargs = dict(
@@ -40,6 +49,22 @@ def main() -> None:
         llm_kwargs["quantization"] = args.quantization
     if args.kv_cache_memory_bytes:
         llm_kwargs["kv_cache_memory_bytes"] = args.kv_cache_memory_bytes
+    if args.gpu_memory_utilization is not None:
+        llm_kwargs["gpu_memory_utilization"] = args.gpu_memory_utilization
+
+    lm_head_overrides = {}
+    if args.lm_head_mode is not None:
+        lm_head_overrides["lm_head_mode"] = args.lm_head_mode
+    if args.lm_head_group_size is not None:
+        lm_head_overrides["lm_head_group_size"] = args.lm_head_group_size
+    if lm_head_overrides:
+        def _patch(cfg, extra=lm_head_overrides):
+            qc = dict(getattr(cfg, "quantization_config", None) or {})
+            qc.update(extra)
+            cfg.quantization_config = qc
+            return cfg
+
+        llm_kwargs["hf_overrides"] = _patch
 
     t0 = time.perf_counter()
     llm = LLM(**llm_kwargs)

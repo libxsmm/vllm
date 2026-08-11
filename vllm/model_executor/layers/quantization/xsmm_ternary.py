@@ -56,6 +56,8 @@ class XsmmTernaryConfig(QuantizationConfig):
         ignored_layers: list[str] | None = None,
         quantize_lm_head: bool = True,
         half_scales: bool = True,
+        lm_head_mode: str | None = None,
+        lm_head_group_size: int | None = None,
     ) -> None:
         super().__init__()
         if group_size % 4 != 0:
@@ -69,11 +71,33 @@ class XsmmTernaryConfig(QuantizationConfig):
         self.half_scales = half_scales
         self.scale_dtype = torch.float16 if half_scales else torch.float32
 
+        # How to treat lm_head. Checkpoints such as cat-q keep lm_head and the
+        # embeddings in 16-bit even though every projection is ternary, so
+        # quantizing it to ternary would corrupt the logits.
+        #   "ternary" -- pack to 2-bit (only valid if lm_head really is ternary)
+        #   "skip"    -- leave dense, unquantized
+        #   "int8"    -- quantize to int8 at load time, halving its bandwidth
+        if lm_head_mode is None:
+            lm_head_mode = "ternary" if quantize_lm_head else "skip"
+        if lm_head_mode not in ("ternary", "skip", "int8"):
+            raise ValueError(
+                "lm_head_mode must be one of 'ternary', 'skip', 'int8'; "
+                f"got {lm_head_mode!r}"
+            )
+        self.lm_head_mode = lm_head_mode
+        self.lm_head_group_size = lm_head_group_size or group_size
+        if self.lm_head_group_size % 4 != 0:
+            raise ValueError(
+                "lm_head_group_size must be a multiple of 4, got "
+                f"{self.lm_head_group_size}"
+            )
+
     def __repr__(self) -> str:
         return (
             f"XsmmTernaryConfig(group_size={self.group_size}, "
             f"pre_packed={self.pre_packed}, "
-            f"quantize_lm_head={self.quantize_lm_head}, "
+            f"lm_head_mode={self.lm_head_mode}, "
+            f"lm_head_group_size={self.lm_head_group_size}, "
             f"half_scales={self.half_scales})"
         )
 
@@ -99,6 +123,10 @@ class XsmmTernaryConfig(QuantizationConfig):
             ignored_layers=cls.get_from_keys_or(config, ["ignored_layers"], None),
             quantize_lm_head=cls.get_from_keys_or(config, ["quantize_lm_head"], True),
             half_scales=cls.get_from_keys_or(config, ["half_scales"], True),
+            lm_head_mode=cls.get_from_keys_or(config, ["lm_head_mode"], None),
+            lm_head_group_size=cls.get_from_keys_or(
+                config, ["lm_head_group_size"], None
+            ),
         )
 
     def get_quant_method(
@@ -109,12 +137,14 @@ class XsmmTernaryConfig(QuantizationConfig):
         if any(prefix.endswith(name) for name in self.ignored_layers):
             return UnquantizedLinearMethod() if isinstance(layer, LinearBase) else None
 
-        # Bonsai stores lm_head ternary too, and it is the single largest GEMV in
-        # the model. It is a ParallelLMHead (not a LinearBase) and vLLM pads the
-        # vocab, so it is always packed at load time rather than pre-packed.
+        # lm_head is the single largest GEMV in the model. It is a
+        # ParallelLMHead (not a LinearBase) and vLLM pads the vocab, so it is
+        # always packed at load time rather than pre-packed.
         if isinstance(layer, ParallelLMHead):
-            if not self.quantize_lm_head:
+            if self.lm_head_mode == "skip":
                 return None
+            if self.lm_head_mode == "int8":
+                return XsmmInt8LinearMethod(self)
             return XsmmTernaryLinearMethod(self, runtime_pack=True)
 
         if not isinstance(layer, LinearBase):
@@ -296,3 +326,87 @@ def _can_pack(n: int, k: int, group_size: int) -> bool:
         and n % XSMM_TERNARY_BLOCK_N == 0
         and k % group_size == 0
     )
+
+
+class XsmmInt8LinearMethod(LinearMethodBase):
+    """Dynamic int8 weight quantization, sharing the int8-activation pipeline.
+
+    Used for lm_head in checkpoints whose projections are ternary but whose
+    output head is not. The weights are loaded dense and quantized once, so the
+    head costs 1 byte per weight instead of 2.
+    """
+
+    def __init__(self, quant_config: XsmmTernaryConfig) -> None:
+        self.quant_config = quant_config
+        self.group_size = quant_config.lm_head_group_size
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        weight_loader = extra_weight_attrs.pop("weight_loader")
+        output_size_per_partition = sum(output_partition_sizes)
+
+        layer.xsmm_int8 = _can_pack(
+            output_size_per_partition, input_size_per_partition, self.group_size
+        )
+        if not layer.xsmm_int8:
+            logger.warning_once(
+                "Shape [%d, %d] is not compatible with the int8 kernel "
+                "(needs N %% %d == 0 and K %% %d == 0); falling back to an "
+                "unquantized GEMM for this layer.",
+                output_size_per_partition,
+                input_size_per_partition,
+                XSMM_TERNARY_BLOCK_N,
+                self.group_size,
+            )
+
+        weight = ModelWeightParameter(
+            data=torch.empty(
+                output_size_per_partition,
+                input_size_per_partition,
+                dtype=params_dtype,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+        set_weight_attrs(weight, extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if not getattr(layer, "xsmm_int8", False):
+            UnquantizedLinearMethod().process_weights_after_loading(layer)
+            return
+
+        packed, scales = torch.ops._C.xsmm_int8_pack_weight(
+            layer.weight.data,
+            self.group_size,
+            self.quant_config.half_scales,
+        )
+        layer.register_parameter("weight", None)
+        layer.register_buffer("xsmm_packed_weight", packed.contiguous())
+        layer.register_buffer("xsmm_weight_scale", scales)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not getattr(layer, "xsmm_int8", False):
+            return UnquantizedLinearMethod().apply(layer, x, bias)
+
+        return torch.ops._C.xsmm_int8_gemm(
+            x,
+            layer.xsmm_packed_weight,
+            layer.xsmm_weight_scale,
+            bias,
+            self.group_size,
+        )

@@ -7,6 +7,9 @@ set -x
 
 cd "$VLLM_SRC"
 
+# the int2 GEMM kernels live in a pinned libxsmm checkout
+bash "$TERNARY_ROOT/scripts/00_fetch_libxsmm.sh"
+
 conda install -y -n "$CONDA_ENV" pip
 
 python -m pip install --upgrade pip

@@ -31,7 +31,23 @@ TARGET_SUFFIXES = (
     "gate_proj.weight",
     "up_proj.weight",
     "down_proj.weight",
+    # gated-delta / linear attention (Qwen3.5)
+    "out_proj.weight",
 )
+
+# vLLM builds one fused parameter out of these leaf modules, so they have to be
+# concatenated before packing: the packed layout blocks 32 output rows together,
+# and a fused packed tensor can only be split again on 32-row boundaries.
+FUSE_GROUPS = {
+    "in_proj_qkvz": ("in_proj_qkv", "in_proj_z"),
+    "in_proj_ba": ("in_proj_b", "in_proj_a"),
+}
+
+# in_proj_ba splits into two 48-row shards, which 32-row blocking cannot express
+FUSE_KEEP_DENSE = frozenset({"in_proj_ba"})
+
+# packable by shape but not ternary
+SKIP_IF_CONTAINS = (".visual.",)
 
 NON_WEIGHT_FILES = (
     "config.json",
@@ -50,7 +66,20 @@ NON_WEIGHT_FILES = (
 
 
 def is_target(name: str, tensor_shape) -> bool:
+    if any(s in f".{name}." for s in SKIP_IF_CONTAINS):
+        return False
     return name.endswith(TARGET_SUFFIXES) and len(tensor_shape) == 2
+
+
+def fuse_target(name: str):
+    """(fused name, position within the group, group members), or None."""
+    if not name.endswith(".weight"):
+        return None
+    parent, _, leaf = name[: -len(".weight")].rpartition(".")
+    for fused, members in FUSE_GROUPS.items():
+        if leaf in members:
+            return f"{parent}.{fused}", members.index(leaf), members
+    return None
 
 
 def ternary_stats(w: torch.Tensor, group_size: int) -> tuple[float, float]:
@@ -92,12 +121,56 @@ def main() -> None:
     n_packed = 0
     n_skipped: list[str] = []
 
+    # members of a fused group are not guaranteed to share a shard
+    shard_of: dict[str, str] = {}
+    for shard in shards:
+        with safe_open(shard, framework="pt") as f:
+            for name in f.keys():
+                shard_of[name] = shard
+
+    def load_tensor(name: str) -> torch.Tensor:
+        with safe_open(shard_of[name], framework="pt") as f:
+            return f.get_tensor(name)
+
     for shard in shards:
         out_name = os.path.basename(shard)
         out_tensors: dict[str, torch.Tensor] = {}
 
         with safe_open(shard, framework="pt") as f:
             for name in f.keys():
+                fused = fuse_target(name)
+                if fused is not None:
+                    fused_name, idx, members = fused
+                    if idx != 0:
+                        continue  # written together with the group's first member
+                    parent = fused_name.rpartition(".")[0]
+                    w = torch.cat(
+                        [load_tensor(f"{parent}.{m}.weight") for m in members],
+                        dim=0,
+                    )
+                    n, c = w.shape
+                    leaf = fused_name.rpartition(".")[2]
+                    if leaf in FUSE_KEEP_DENSE or n % BLOCK_N != 0 or c % g != 0:
+                        out_tensors[f"{fused_name}.weight"] = w
+                        continue
+
+                    if args.check:
+                        exact, rel = ternary_stats(w, g)
+                        print(f"  {fused_name} {tuple(w.shape)}: "
+                              f"ternary={exact * 100:.2f}% "
+                              f"max_rel_recon_err={rel:.3e}")
+
+                    packed, scales = torch.ops._C.xsmm_ternary_pack_weight(
+                        w, g, not args.fp32_scales
+                    )
+                    out_tensors[f"{fused_name}.weight_packed"] = packed
+                    out_tensors[f"{fused_name}.weight_scale"] = (
+                        scales.permute(0, 2, 1).reshape(n, c // g).contiguous()
+                    )
+                    n_packed += 1
+                    del w, packed, scales
+                    continue
+
                 t = f.get_tensor(name)
 
                 if not is_target(name, t.shape):
@@ -140,10 +213,15 @@ def main() -> None:
         json.dump({"metadata": {"total_size": total_size},
                    "weight_map": weight_map}, f, indent=2)
 
-    for fname in NON_WEIGHT_FILES:
+    # copy everything that is not a weight shard: tokenizer, chat template,
+    # and for multimodal checkpoints the processor / preprocessor configs
+    for fname in sorted(os.listdir(args.src)):
         src = os.path.join(args.src, fname)
-        if os.path.exists(src):
-            shutil.copy2(src, os.path.join(args.dst, fname))
+        if not os.path.isfile(src):
+            continue
+        if fname.endswith(".safetensors") or fname == "model.safetensors.index.json":
+            continue
+        shutil.copy2(src, os.path.join(args.dst, fname))
 
     cfg_path = os.path.join(args.dst, "config.json")
     with open(cfg_path) as f:

@@ -280,8 +280,14 @@ class Qwen3_5Model(Qwen3NextModel):
                 n_shared_experts=1,
                 ckpt_prefix="mlp.shared_expert",
             )
+        # A pre-packed checkpoint already ships the GDN projections fused, so the
+        # in_proj_qkv/z and in_proj_b/a stacking must not fire (the base mapper
+        # still stacks qkv_proj and gate_up_proj, which stay split on disk).
+        mapper = self.hf_to_vllm_mapper
+        if getattr(self.quant_config, "pre_packed", False):
+            mapper = Qwen3NextModel.hf_to_vllm_mapper
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        return loader.load_weights(weights, mapper=mapper)
 
 
 class Qwen3_5ForCausalLMBase(

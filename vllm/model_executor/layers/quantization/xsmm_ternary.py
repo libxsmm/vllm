@@ -79,9 +79,15 @@ class XsmmTernaryConfig(QuantizationConfig):
         self.group_size = group_size
         # True when the checkpoint already stores weight_packed/weight_scale
         self.pre_packed = pre_packed
-        # The MoE router is a small dense Linear whose shape happens to be
-        # packable, but it is never ternary; quantizing it corrupts routing.
-        self.ignored_layers = list(ignored_layers) if ignored_layers else ["mlp.gate"]
+        # Matched per dotted component, so "mlp.gate" does not also catch
+        # "mlp.gate_proj". The MoE router and the Qwen3.5 vision tower are both
+        # packable by shape but are not ternary; in_proj_ba is ternary but splits
+        # into two 48-row shards, which 32-row blocking cannot express.
+        self.ignored_layers = (
+            list(ignored_layers)
+            if ignored_layers
+            else ["mlp.gate", "visual", "in_proj_ba"]
+        )
         self.quantize_lm_head = quantize_lm_head
         # fp16 weight scales: 1 per 128 values, so this is 11% of weight traffic
         self.half_scales = half_scales
@@ -150,12 +156,19 @@ class XsmmTernaryConfig(QuantizationConfig):
             quantize_moe=cls.get_from_keys_or(config, ["quantize_moe"], True),
         )
 
+    def _is_ignored(self, prefix: str) -> bool:
+        padded = f".{prefix}."
+        return any(
+            prefix.endswith(name) or f".{name}." in padded
+            for name in self.ignored_layers
+        )
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> QuantizeMethodBase | None:
         from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
-        if any(prefix.endswith(name) for name in self.ignored_layers):
+        if self._is_ignored(prefix):
             if isinstance(layer, RoutedExperts):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             return UnquantizedLinearMethod() if isinstance(layer, LinearBase) else None

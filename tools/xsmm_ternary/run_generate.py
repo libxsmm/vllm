@@ -36,6 +36,8 @@ def main() -> None:
                         "checkpoint's group_size)")
     # on the CPU backend this is the fraction of host RAM vLLM reserves
     p.add_argument("--gpu-memory-utilization", type=float, default=None)
+    p.add_argument("--no-quantize-moe", action="store_true",
+                   help="run MoE experts unquantized (dense 16-bit reference)")
     args = p.parse_args()
 
     llm_kwargs = dict(
@@ -57,9 +59,15 @@ def main() -> None:
         lm_head_overrides["lm_head_mode"] = args.lm_head_mode
     if args.lm_head_group_size is not None:
         lm_head_overrides["lm_head_group_size"] = args.lm_head_group_size
-    if lm_head_overrides:
-        def _patch(cfg, extra=lm_head_overrides):
+    if args.no_quantize_moe:
+        lm_head_overrides["quantize_moe"] = False
+    # For a checkpoint that carries no quantization_config (e.g. a dense cat-q
+    # export), declare the method here so vLLM does not reject --quantization.
+    if lm_head_overrides or args.quantization:
+        def _patch(cfg, extra=lm_head_overrides, method=args.quantization):
             qc = dict(getattr(cfg, "quantization_config", None) or {})
+            if method:
+                qc.setdefault("quant_method", method)
             qc.update(extra)
             cfg.quantization_config = qc
             return cfg

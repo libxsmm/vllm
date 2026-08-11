@@ -4,7 +4,7 @@ export TERNARY_ROOT=/data/nfs_home/egeorgan/cpu_ternary_vllm
 export VLLM_SRC=$TERNARY_ROOT/vllm
 export CONDA_ROOT=/data/nfs_home/egeorgan/miniforge3
 export CONDA_ENV=ternary_vllm
-export SLURM_TARGET_JOBID=354896
+export SLURM_TARGET_JOBID=355139
 
 # conda's (de)activate.d hooks are not `set -u` clean, so relax it while sourcing
 __ternary_saved_opts=$(set +o)

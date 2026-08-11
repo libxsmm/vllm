@@ -38,6 +38,9 @@ def main() -> None:
     p.add_argument("--gpu-memory-utilization", type=float, default=None)
     p.add_argument("--no-quantize-moe", action="store_true",
                    help="run MoE experts unquantized (dense 16-bit reference)")
+    p.add_argument("--warmup-tokens", type=int, default=0,
+                   help="run a throwaway generation first, so the timed run "
+                        "sees the weights already resident")
     args = p.parse_args()
 
     llm_kwargs = dict(
@@ -93,8 +96,15 @@ def main() -> None:
         ]
     sampling = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens)
 
-    # warmup so the LIBXSMM JIT cache is primed before we time anything
-    llm.generate(prompts[:1], SamplingParams(temperature=0.0, max_tokens=8))
+    # Warmup primes the LIBXSMM JIT cache and faults the weights in. For MoE,
+    # 8 tokens only reach ~40% of experts (each token picks top_k of E at
+    # random), so a longer warmup is needed to touch the whole model.
+    llm.generate(
+        prompts[:1],
+        SamplingParams(
+            temperature=0.0, max_tokens=max(8, args.warmup_tokens)
+        ),
+    )
 
     t0 = time.perf_counter()
     outputs = llm.generate(prompts, sampling)

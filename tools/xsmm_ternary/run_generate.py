@@ -38,6 +38,8 @@ def main() -> None:
     p.add_argument("--gpu-memory-utilization", type=float, default=None)
     p.add_argument("--no-quantize-moe", action="store_true",
                    help="run MoE experts unquantized (dense 16-bit reference)")
+    p.add_argument("--ignore-eos", action="store_true",
+                   help="generate exactly --max-tokens, for throughput numbers")
     p.add_argument("--warmup-tokens", type=int, default=0,
                    help="run a throwaway generation first, so the timed run "
                         "sees the weights already resident")
@@ -94,7 +96,8 @@ def main() -> None:
             )
             for p in prompts
         ]
-    sampling = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens)
+    sampling = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens,
+                              ignore_eos=args.ignore_eos)
 
     # Warmup primes the LIBXSMM JIT cache and faults the weights in. For MoE,
     # 8 tokens only reach ~40% of experts (each token picks top_k of E at

@@ -528,6 +528,7 @@ if (ENABLE_X86_ISA)
         "csrc/cpu/shm.cpp"
         "csrc/cpu/cpu_wna16.cpp"
         "csrc/cpu/xsmm_ternary.cpp"
+        "csrc/cpu/xsmm_ternary_bitmap.cpp"
         "csrc/cpu/cpu_fused_moe.cpp"
         "csrc/cpu/utils.cpp"
         "csrc/cpu/spec_decode_utils.cpp"
@@ -542,9 +543,16 @@ if (ENABLE_X86_ISA)
         "csrc/cpu/pos_encoding.cpp"
         "csrc/moe/dynamic_4bit_int_moe_cpu.cpp") 
 
+    # the bitmap GEMV needs fp16 FMA (AVX-512 path), vpdpbssd (AVX2 path) and
+    # pdep, none of which are in the baseline flag sets; entry points are
+    # runtime-guarded so the file can link into every ISA target
+    set_source_files_properties("csrc/cpu/xsmm_ternary_bitmap.cpp"
+        PROPERTIES COMPILE_OPTIONS "-O3;-mavxvnniint8;-mbmi2")
+
     set(VLLM_EXT_SRC_AVX2
         "csrc/cpu/sgl-kernels/fla.cpp"
         "csrc/cpu/xsmm_ternary.cpp"
+        "csrc/cpu/xsmm_ternary_bitmap.cpp"
         "csrc/cpu/cpu_fused_moe.cpp"
         "csrc/cpu/utils.cpp"
         "csrc/cpu/spec_decode_utils.cpp"

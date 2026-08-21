@@ -32,6 +32,11 @@
 #define XSMM_TERNARY_AVX2 1
 #endif
 
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#define XSMM_TERNARY_AVX512 1
+#endif
+
 namespace {
 
 // One 32-byte ymm load of packed weights feeds 32 output columns; fixed by the
@@ -183,6 +188,21 @@ inline __m256i pack32_ps_to_epi8(__m256 a, __m256 b, __m256 c, __m256 d) {
 
 #endif  // XSMM_TERNARY_AVX2
 
+#ifdef XSMM_TERNARY_AVX512
+
+inline __m512 load16_ps(const float* p) { return _mm512_loadu_ps(p); }
+
+inline __m512 load16_ps(const at::Half* p) {
+  return _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)));
+}
+
+inline __m512 load16_ps(const at::BFloat16* p) {
+  const __m256i h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+  return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(h), 16));
+}
+
+#endif  // XSMM_TERNARY_AVX512
+
 // Symmetric int8 quantization of one group of G activations.
 template <typename scalar_t>
 inline void quantize_group(
@@ -190,6 +210,29 @@ inline void quantize_group(
     int8_t* __restrict dst,
     int64_t G,
     float& scale_out) {
+#ifdef XSMM_TERNARY_AVX512
+  if constexpr (Avx2Loadable<scalar_t>::value) {
+    if ((G & 15) == 0) {
+      __m512 vmax = _mm512_setzero_ps();
+      for (int64_t j = 0; j < G; j += 16) {
+        vmax = _mm512_max_ps(vmax, _mm512_abs_ps(load16_ps(src + j)));
+      }
+      const float amax = _mm512_reduce_max_ps(vmax);
+      const float scale = amax / 127.0f;
+      scale_out = scale;
+      const __m512 viscale =
+          _mm512_set1_ps(scale != 0.0f ? (1.0f / scale) : 0.0f);
+
+      // vpmovsdb replaces the AVX2 two-stage pack plus lane-fixup permute
+      for (int64_t j = 0; j < G; j += 16) {
+        const __m512 v = _mm512_mul_ps(load16_ps(src + j), viscale);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + j),
+                         _mm512_cvtsepi32_epi8(_mm512_cvtps_epi32(v)));
+      }
+      return;
+    }
+  }
+#endif
 #ifdef XSMM_TERNARY_AVX2
   if constexpr (Avx2Loadable<scalar_t>::value) {
     if ((G & 31) == 0) {
@@ -240,7 +283,15 @@ inline void dequant_store(
     float* __restrict dst,
     float act_scale,
     const wscale_t* __restrict wsc) {
-#ifdef XSMM_TERNARY_AVX2
+#ifdef XSMM_TERNARY_AVX512
+  const __m512 dx = _mm512_set1_ps(act_scale);
+  for (int r = 0; r < kBlockN; r += 16) {
+    const __m512 sc = _mm512_mul_ps(dx, load16_ps(wsc + r));
+    const __m512 acc = _mm512_cvtepi32_ps(
+        _mm512_loadu_si512(reinterpret_cast<const void*>(src + r)));
+    _mm512_storeu_ps(dst + r, _mm512_mul_ps(sc, acc));
+  }
+#elif defined(XSMM_TERNARY_AVX2)
   const __m256 dx = _mm256_set1_ps(act_scale);
   for (int r = 0; r < kBlockN; r += 8) {
     const __m256 sc = _mm256_mul_ps(dx, load8_ps(wsc + r));
@@ -262,7 +313,16 @@ inline void dequant_accum(
     float* __restrict dst,
     float act_scale,
     const wscale_t* __restrict wsc) {
-#ifdef XSMM_TERNARY_AVX2
+#ifdef XSMM_TERNARY_AVX512
+  const __m512 dx = _mm512_set1_ps(act_scale);
+  for (int r = 0; r < kBlockN; r += 16) {
+    const __m512 sc = _mm512_mul_ps(dx, load16_ps(wsc + r));
+    const __m512 acc = _mm512_cvtepi32_ps(
+        _mm512_loadu_si512(reinterpret_cast<const void*>(src + r)));
+    _mm512_storeu_ps(dst + r,
+                     _mm512_fmadd_ps(sc, acc, _mm512_loadu_ps(dst + r)));
+  }
+#elif defined(XSMM_TERNARY_AVX2)
   const __m256 dx = _mm256_set1_ps(act_scale);
   for (int r = 0; r < kBlockN; r += 8) {
     const __m256 sc = _mm256_mul_ps(dx, load8_ps(wsc + r));
@@ -291,7 +351,19 @@ inline void dequant_finalize(
     const scalar_t* __restrict bias,
     scalar_t* __restrict dst) {
   alignas(64) float fin[kBlockN];
-#ifdef XSMM_TERNARY_AVX2
+#ifdef XSMM_TERNARY_AVX512
+  const __m512 dx = _mm512_set1_ps(act_scale);
+  for (int r = 0; r < kBlockN; r += 16) {
+    const __m512 sc = _mm512_mul_ps(dx, load16_ps(wsc + r));
+    const __m512 a = _mm512_cvtepi32_ps(
+        _mm512_loadu_si512(reinterpret_cast<const void*>(src + r)));
+    __m512 v = _mm512_mul_ps(sc, a);
+    if (accumulate) {
+      v = _mm512_add_ps(v, _mm512_loadu_ps(acc + r));
+    }
+    _mm512_storeu_ps(fin + r, v);
+  }
+#elif defined(XSMM_TERNARY_AVX2)
   const __m256 dx = _mm256_set1_ps(act_scale);
   for (int r = 0; r < kBlockN; r += 8) {
     const __m256 sc = _mm256_mul_ps(dx, load8_ps(wsc + r));
@@ -332,7 +404,11 @@ void quantize_activations(
     int64_t G) {
   const int64_t C1 = C / G;
 
+#ifdef __AVX512F__
+#pragma omp parallel for schedule(static)
+#else
 #pragma omp parallel for schedule(dynamic, 1)
+#endif
   for (int64_t m = 0; m < M; ++m) {
     for (int64_t c1 = 0; c1 < C1; ++c1) {
       quantize_group<scalar_t>(
@@ -406,7 +482,13 @@ void ternary_gemm_tiles(
     gemm_param.op.tertiary = &br_count;
     gemm_param.c.primary = acc_i32;
 
+// Every tile is the same cost, so on the server parts the shared counter of a
+// dynamic schedule costs more than it balances.
+#ifdef __AVX512F__
+#pragma omp for schedule(static)
+#else
 #pragma omp for schedule(dynamic, 1)
+#endif
     for (int64_t work = 0; work < n_work; ++work) {
       const int64_t n1 = work / plan.m_blocks;
       const int64_t mb = work % plan.m_blocks;
@@ -440,6 +522,94 @@ void ternary_gemm_tiles(
           } else {
             dequant_accum<wscale_t>(src, a, xsc, wsc);
           }
+        }
+      }
+    }
+  }
+}
+
+// Merged gate_up projection with silu(gate)*up folded into the tile epilogue.
+// The gate and up halves of a merged projection are 32-column blocks n1 and
+// n1 + N1/2, so one work item owns both and the intermediate never reaches
+// memory. Saves a parallel region and a read+write of [M, 2I] per layer.
+template <typename scalar_t, typename wscale_t>
+void ternary_gemm_silu_mul_tiles(
+    const TernaryGemmPlan& plan,
+    const uint8_t* __restrict w,
+    const wscale_t* __restrict ws,
+    const int8_t* __restrict xq,
+    const float* __restrict xs,
+    const scalar_t* __restrict bias,
+    scalar_t* __restrict out) {
+  const int64_t group_bytes = plan.group_bytes;
+  const int64_t panel_bytes = plan.C1 * group_bytes;
+  const int64_t C1 = plan.C1;
+  const int64_t N1h = plan.N1 / 2;
+  const int64_t I = N1h * kBlockN;
+  const int64_t n_work = N1h * plan.m_blocks;
+
+#pragma omp parallel
+  {
+    alignas(64) int32_t acc_i32[kBlockM * kBlockN];
+    alignas(64) float res[2][kBlockM * kBlockN];
+
+    libxsmm_gemm_param gemm_param;
+    std::memset(&gemm_param, 0, sizeof(gemm_param));
+    unsigned long long br_count = 1;
+    gemm_param.op.tertiary = &br_count;
+    gemm_param.c.primary = acc_i32;
+
+#ifdef __AVX512F__
+#pragma omp for schedule(static)
+#else
+#pragma omp for schedule(dynamic, 1)
+#endif
+    for (int64_t work = 0; work < n_work; ++work) {
+      const int64_t n1 = work / plan.m_blocks;
+      const int64_t mb = work % plan.m_blocks;
+      const int64_t m0 = mb * plan.m_full;
+      const int64_t m_cur =
+          (mb + 1 == plan.m_blocks) ? plan.m_rem : plan.m_full;
+      const auto kernel = (m_cur == plan.m_full) ? plan.k_full : plan.k_rem;
+
+      for (int half = 0; half < 2; ++half) {
+        const int64_t nb = n1 + half * N1h;
+        for (int64_t c1 = 0; c1 < C1; ++c1) {
+          gemm_param.a.primary =
+              const_cast<uint8_t*>(w + nb * panel_bytes + c1 * group_bytes);
+          gemm_param.b.primary =
+              const_cast<int8_t*>(xq + m0 * plan.C + c1 * plan.G);
+          kernel(&gemm_param);
+
+          const wscale_t* wsc = ws + (nb * C1 + c1) * kBlockN;
+          for (int64_t m = 0; m < m_cur; ++m) {
+            const int32_t* src = acc_i32 + m * kBlockN;
+            float* a = res[half] + m * kBlockN;
+            const float xsc = xs[(m0 + m) * C1 + c1];
+            if (c1 == 0) {
+              dequant_store<wscale_t>(src, a, xsc, wsc);
+            } else {
+              dequant_accum<wscale_t>(src, a, xsc, wsc);
+            }
+          }
+        }
+      }
+
+      const scalar_t* bg = (bias != nullptr) ? bias + n1 * kBlockN : nullptr;
+      const scalar_t* bu =
+          (bias != nullptr) ? bias + (n1 + N1h) * kBlockN : nullptr;
+      for (int64_t m = 0; m < m_cur; ++m) {
+        const float* g = res[0] + m * kBlockN;
+        const float* u = res[1] + m * kBlockN;
+        scalar_t* dst = out + (m0 + m) * I + n1 * kBlockN;
+        for (int r = 0; r < kBlockN; ++r) {
+          float gv = g[r];
+          float uv = u[r];
+          if (bias != nullptr) {
+            gv += static_cast<float>(bg[r]);
+            uv += static_cast<float>(bu[r]);
+          }
+          dst[r] = static_cast<scalar_t>(gv / (1.0f + std::exp(-gv)) * uv);
         }
       }
     }
@@ -559,7 +729,11 @@ void moe_run(
     gp.op.tertiary = &br_count;
     gp.c.primary = acc_i32;
 
+#ifdef __AVX512F__
+#pragma omp for schedule(static)
+#else
 #pragma omp for schedule(dynamic, 1)
+#endif
     for (int64_t w = 0; w < static_cast<int64_t>(a_work.size()); ++w) {
       const MoeWork it = a_work[w];
       const int64_t base = s.offsets[it.e];
@@ -592,7 +766,11 @@ void moe_run(
       }
     }
 
+#ifdef __AVX512F__
+#pragma omp for schedule(static)
+#else
 #pragma omp for schedule(dynamic, 1)
+#endif
     for (int64_t w = 0; w < static_cast<int64_t>(b_work.size()); ++w) {
       const MoeWork it = b_work[w];
       const int64_t base = s.offsets[it.e];
@@ -831,7 +1009,11 @@ std::tuple<torch::Tensor, torch::Tensor> xsmm_ternary_pack_weight(
 
   const int64_t tiles = N1 * C1;
 
+#ifdef __AVX512F__
+#pragma omp parallel for schedule(static)
+#else
 #pragma omp parallel for schedule(dynamic, 1)
+#endif
   for (int64_t t = 0; t < tiles; ++t) {
     const int64_t n1 = t / C1;
     const int64_t c1 = t % C1;
@@ -906,7 +1088,11 @@ std::tuple<torch::Tensor, torch::Tensor> xsmm_int8_pack_weight(
 
   const int64_t tiles = N1 * C1;
 
+#ifdef __AVX512F__
+#pragma omp parallel for schedule(static)
+#else
 #pragma omp parallel for schedule(dynamic, 1)
+#endif
   for (int64_t t = 0; t < tiles; ++t) {
     const int64_t n1 = t / C1;
     const int64_t c1 = t % C1;
@@ -951,7 +1137,8 @@ static void quant_gemm_into(
     const std::optional<torch::Tensor>& bias,
     int64_t group_size,
     torch::Tensor& out,
-    int wbits) {
+    int wbits,
+    bool fuse_silu_mul = false) {
   TORCH_CHECK(input.dim() >= 2, "input must have at least 2 dims");
   TORCH_CHECK(packed.dim() == 5, "packed weight must be 5-D");
   TORCH_CHECK(
@@ -978,10 +1165,13 @@ static void quant_gemm_into(
   TORCH_CHECK(
       scales.size(0) == N1 && scales.size(1) == C1 && scales.size(2) == kBlockN,
       "scales shape mismatch");
+  TORCH_CHECK(!fuse_silu_mul || N1 % 2 == 0,
+              "fused silu_mul needs an even number of 32-column blocks");
+  const int64_t N_out = fuse_silu_mul ? N / 2 : N;
   TORCH_CHECK(
-      out.numel() == M * N && out.is_contiguous() &&
+      out.numel() == M * N_out && out.is_contiguous() &&
           out.scalar_type() == x.scalar_type(),
-      "out must be contiguous with ", M * N, " elements of the input dtype");
+      "out must be contiguous with ", M * N_out, " elements of the input dtype");
 
   // Activations: symmetric per (row, group) int8, matching the weight grouping.
   auto& scratch = ternary_scratch();
@@ -1041,7 +1231,17 @@ static void quant_gemm_into(
         }
         quantize_activations<scalar_t>(
             x.data_ptr<scalar_t>(), xq_ptr, xs_ptr, M, C, G);
-        if (half_ws) {
+        if (fuse_silu_mul) {
+          if (half_ws) {
+            ternary_gemm_silu_mul_tiles<scalar_t, at::Half>(
+                plan, w_ptr, scales.data_ptr<at::Half>(), xq_ptr, xs_ptr,
+                bias_ptr, out.data_ptr<scalar_t>());
+          } else {
+            ternary_gemm_silu_mul_tiles<scalar_t, float>(
+                plan, w_ptr, scales.data_ptr<float>(), xq_ptr, xs_ptr,
+                bias_ptr, out.data_ptr<scalar_t>());
+          }
+        } else if (half_ws) {
           ternary_gemm_tiles<scalar_t, at::Half>(
               plan, w_ptr, scales.data_ptr<at::Half>(), xq_ptr, xs_ptr,
               bias_ptr, out.data_ptr<scalar_t>());
@@ -1088,6 +1288,20 @@ void xsmm_ternary_gemm_out(
   quant_gemm_into(input, packed, scales, bias, group_size, out, /*wbits=*/2);
 }
 
+torch::Tensor xsmm_ternary_gemm_silu_mul(
+    const torch::Tensor& input,
+    const torch::Tensor& packed,
+    const torch::Tensor& scales,
+    const std::optional<torch::Tensor>& bias,
+    int64_t group_size) {
+  auto out_sizes = input.sizes().vec();
+  out_sizes.back() = packed.size(0) * kBlockN / 2;
+  auto out = torch::empty(out_sizes, input.options());
+  quant_gemm_into(input, packed, scales, bias, group_size, out, /*wbits=*/2,
+                  /*fuse_silu_mul=*/true);
+  return out;
+}
+
 torch::Tensor xsmm_int8_gemm(
     const torch::Tensor& input,
     const torch::Tensor& packed,
@@ -1109,6 +1323,15 @@ void xsmm_int8_gemm_out(
     int64_t group_size,
     torch::Tensor& out) {
   quant_gemm_into(input, packed, scales, bias, group_size, out, /*wbits=*/8);
+}
+
+// Lets the bitmap kernel in xsmm_ternary_bitmap.cpp share these counters.
+void xsmm_ternary_record(int64_t rows, int64_t bytes, int64_t nanos) {
+  auto& st = ternary_stats();
+  st.calls.fetch_add(1, std::memory_order_relaxed);
+  st.rows.fetch_add(rows, std::memory_order_relaxed);
+  st.weight_bytes.fetch_add(bytes, std::memory_order_relaxed);
+  st.nanos.fetch_add(nanos, std::memory_order_relaxed);
 }
 
 // (calls, rows, weight_bytes, seconds) accumulated since the last reset.

@@ -213,6 +213,11 @@ void xsmm_ternary_gemm_out(const torch::Tensor& input,
                            const std::optional<torch::Tensor>& bias,
                            int64_t group_size, torch::Tensor& out);
 
+torch::Tensor xsmm_ternary_gemm_silu_mul(
+    const torch::Tensor& input, const torch::Tensor& packed,
+    const torch::Tensor& scales, const std::optional<torch::Tensor>& bias,
+    int64_t group_size);
+
 std::tuple<torch::Tensor, torch::Tensor> xsmm_int8_pack_weight(
     const torch::Tensor& weight, int64_t group_size, bool half_scales);
 
@@ -244,6 +249,31 @@ void xsmm_hugepage_advise(torch::Tensor& t);
 std::tuple<int64_t, int64_t, int64_t, double> xsmm_ternary_stats();
 
 void xsmm_ternary_reset_stats();
+
+bool xsmm_ternary_bitmap_supported();
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+xsmm_ternary_bitmap_pack(const torch::Tensor& packed, const torch::Tensor& scales,
+                         int64_t group_size);
+
+torch::Tensor xsmm_ternary_bitmap_gemv(
+    const torch::Tensor& input, const torch::Tensor& bitmap,
+    const torch::Tensor& signs, const torch::Tensor& sgn_off,
+    const torch::Tensor& scales, const std::optional<torch::Tensor>& bias,
+    int64_t group_size);
+
+torch::Tensor xsmm_ternary_bitmap_gemv_silu_mul(
+    const torch::Tensor& input, const torch::Tensor& bitmap,
+    const torch::Tensor& signs, const torch::Tensor& sgn_off,
+    const torch::Tensor& scales, int64_t group_size);
+
+torch::Tensor xsmm_ternary_bitmap_moe(
+    const torch::Tensor& input, const torch::Tensor& topk_ids,
+    const torch::Tensor& topk_weights, const torch::Tensor& w13_bitmap,
+    const torch::Tensor& w13_signs, const torch::Tensor& w13_sgn_off,
+    const torch::Tensor& w13_scales, const torch::Tensor& w2_bitmap,
+    const torch::Tensor& w2_signs, const torch::Tensor& w2_sgn_off,
+    const torch::Tensor& w2_scales, int64_t group_size);
 #endif
 
 void prepack_moe_weight(const torch::Tensor& weight,
@@ -677,6 +707,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor? bias, SymInt group_size, Tensor(a5!) out) -> ()");
   ops.impl("xsmm_ternary_gemm_out", torch::kCPU, &xsmm_ternary_gemm_out);
   ops.def(
+      "xsmm_ternary_gemm_silu_mul(Tensor input, Tensor packed, Tensor scales, "
+      "Tensor? bias, SymInt group_size) -> Tensor");
+  ops.impl("xsmm_ternary_gemm_silu_mul", torch::kCPU,
+           &xsmm_ternary_gemm_silu_mul);
+  ops.def(
       "xsmm_int8_pack_weight(Tensor weight, SymInt group_size, "
       "bool half_scales=False) -> (Tensor, Tensor)");
   ops.impl("xsmm_int8_pack_weight", torch::kCPU, &xsmm_int8_pack_weight);
@@ -702,6 +737,28 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("xsmm_ternary_stats", &xsmm_ternary_stats);
   ops.def("xsmm_ternary_reset_stats() -> ()");
   ops.impl("xsmm_ternary_reset_stats", &xsmm_ternary_reset_stats);
+  ops.def("xsmm_ternary_bitmap_supported() -> bool");
+  ops.impl("xsmm_ternary_bitmap_supported", &xsmm_ternary_bitmap_supported);
+  ops.def(
+      "xsmm_ternary_bitmap_pack(Tensor packed, Tensor scales, int group_size) "
+      "-> (Tensor, Tensor, Tensor, Tensor)");
+  ops.impl("xsmm_ternary_bitmap_pack", torch::kCPU, &xsmm_ternary_bitmap_pack);
+  ops.def(
+      "xsmm_ternary_bitmap_gemv(Tensor input, Tensor bitmap, Tensor signs, "
+      "Tensor sgn_off, Tensor scales, Tensor? bias, int group_size) -> Tensor");
+  ops.impl("xsmm_ternary_bitmap_gemv", torch::kCPU, &xsmm_ternary_bitmap_gemv);
+  ops.def(
+      "xsmm_ternary_bitmap_gemv_silu_mul(Tensor input, Tensor bitmap, "
+      "Tensor signs, Tensor sgn_off, Tensor scales, int group_size) -> Tensor");
+  ops.impl("xsmm_ternary_bitmap_gemv_silu_mul", torch::kCPU,
+           &xsmm_ternary_bitmap_gemv_silu_mul);
+  ops.def(
+      "xsmm_ternary_bitmap_moe(Tensor input, Tensor topk_ids, "
+      "Tensor topk_weights, Tensor w13_bitmap, Tensor w13_signs, "
+      "Tensor w13_sgn_off, Tensor w13_scales, Tensor w2_bitmap, "
+      "Tensor w2_signs, Tensor w2_sgn_off, Tensor w2_scales, int group_size) "
+      "-> Tensor");
+  ops.impl("xsmm_ternary_bitmap_moe", torch::kCPU, &xsmm_ternary_bitmap_moe);
 #endif
 
   // fused moe

@@ -120,6 +120,16 @@ def process_weights_after_loading(
             # the caching allocator, which starves the OS on UMA devices.
             release_device_memory_under_pressure(target_device)
 
+    # Needs the parent MLP module, so it cannot run from a per-layer hook.
+    try:
+        from vllm.model_executor.layers.quantization.xsmm_ternary import (
+            fuse_silu_mlps,
+        )
+
+        fuse_silu_mlps(model)
+    except ImportError:
+        pass
+
     # Initialize post-load attention weights for any attention layer and MM
     # encoder. NOTE: Happens after other modules so we can easily decompress
     # weights.

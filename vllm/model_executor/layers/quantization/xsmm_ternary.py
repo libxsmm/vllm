@@ -57,6 +57,109 @@ _REUSE_OUTPUT_BUFFER = os.environ.get("VLLM_XSMM_TERNARY_REUSE_OUT", "0") == "1"
 # Escape hatch to compare the fused MoE op against the per-expert Python loop.
 _MOE_UNFUSED = os.environ.get("VLLM_XSMM_TERNARY_MOE_UNFUSED", "0") == "1"
 _MOE_HUGEPAGE = os.environ.get("VLLM_XSMM_TERNARY_HUGEPAGE", "0") == "1"
+# bitmap + compacted signs instead of the fixed-width int2 packing; the weights
+# are repacked from the int2 layout at load time, so the checkpoint is unchanged
+_BITMAP = os.environ.get("VLLM_XSMM_TERNARY_BITMAP", "0") == "1"
+_BITMAP_LAYERS = 0
+
+
+def _register_fake_kernels() -> None:
+    """Shape functions for torch.compile, which traces on data-less meta tensors.
+
+    Without these every ternary op raises NotImplementedError under PT2 and the
+    model cannot be compiled at all.
+    """
+
+    def _out_shape(x: torch.Tensor, blocks: torch.Tensor) -> list[int]:
+        shape = list(x.shape)
+        shape[-1] = blocks.shape[0] * XSMM_TERNARY_BLOCK_N
+        return shape
+
+    @torch.library.register_fake("_C::xsmm_ternary_gemm")
+    def _(input, packed, scales, bias, group_size):
+        return input.new_empty(_out_shape(input, packed))
+
+    @torch.library.register_fake("_C::xsmm_ternary_gemm_out")
+    def _(input, packed, scales, bias, group_size, out):
+        return None
+
+    @torch.library.register_fake("_C::xsmm_ternary_gemm_silu_mul")
+    def _(input, packed, scales, bias, group_size):
+        shape = _out_shape(input, packed)
+        shape[-1] //= 2
+        return input.new_empty(shape)
+
+    @torch.library.register_fake("_C::xsmm_ternary_bitmap_gemv")
+    def _(input, bitmap, signs, sgn_off, scales, bias, group_size):
+        return input.new_empty(_out_shape(input, bitmap))
+
+    @torch.library.register_fake("_C::xsmm_ternary_bitmap_gemv_silu_mul")
+    def _(input, bitmap, signs, sgn_off, scales, group_size):
+        shape = _out_shape(input, bitmap)
+        shape[-1] //= 2
+        return input.new_empty(shape)
+
+
+try:
+    _register_fake_kernels()
+except (RuntimeError, AttributeError) as exc:  # already registered, or op missing
+    logger.debug("xsmm_ternary: fake kernels not registered (%s)", exc)
+
+
+# Fold SiluAndMul into the gate_up GEMM epilogue. Measured 1.48x on the gate_up
+# shape at 64 threads: it removes one OpenMP parallel region and a round trip of
+# the [M, 2I] intermediate per layer.
+_FUSE_SILU = os.environ.get("VLLM_XSMM_TERNARY_FUSE_SILU", "1") == "1"
+
+
+def fuse_silu_mlps(model: torch.nn.Module) -> int:
+    """Swap `act_fn(gate_up_proj(x))` for the fused ternary GEMM where possible."""
+    if not _FUSE_SILU:
+        return 0
+
+    from vllm.model_executor.layers.activation import SiluAndMul
+
+    fused = 0
+    for module in model.modules():
+        gate_up = getattr(module, "gate_up_proj", None)
+        act_fn = getattr(module, "act_fn", None)
+        down = getattr(module, "down_proj", None)
+        if gate_up is None or down is None or not isinstance(act_fn, SiluAndMul):
+            continue
+        # the bitmap layout has no fused epilogue, and an unquantized layer has
+        # no packed weight to hand to the op
+        if not getattr(gate_up, "xsmm_ternary", False):
+            continue
+        if getattr(gate_up, "bias", None) is not None:
+            continue
+
+        group_size = gate_up.quant_method.quant_config.group_size
+
+        if getattr(gate_up, "xsmm_bitmap", None) is not None:
+
+            def forward(x, _gu=gate_up, _down=down, _g=group_size):
+                y = torch.ops._C.xsmm_ternary_bitmap_gemv_silu_mul(
+                    x, _gu.xsmm_bitmap, _gu.xsmm_signs, _gu.xsmm_sgn_off,
+                    _gu.xsmm_bitmap_scale, _g
+                )
+                out, _ = _down(y)
+                return out
+
+        else:
+
+            def forward(x, _gu=gate_up, _down=down, _g=group_size):
+                y = torch.ops._C.xsmm_ternary_gemm_silu_mul(
+                    x, _gu.xsmm_packed_weight, _gu.xsmm_weight_scale, None, _g
+                )
+                out, _ = _down(y)
+                return out
+
+        module.forward = forward
+        fused += 1
+
+    if fused:
+        logger.info("xsmm_ternary: fused silu_and_mul into %d gate_up GEMMs", fused)
+    return fused
 
 
 class XsmmTernaryConfig(QuantizationConfig):
@@ -309,6 +412,22 @@ class XsmmTernaryLinearMethod(LinearMethodBase):
         layer.register_buffer("xsmm_packed_weight", packed.contiguous())
         layer.register_buffer("xsmm_weight_scale", scales)
 
+        if _BITMAP and torch.ops._C.xsmm_ternary_bitmap_supported():
+            bitmap, signs, sgn_off, bscales = torch.ops._C.xsmm_ternary_bitmap_pack(
+                layer.xsmm_packed_weight,
+                layer.xsmm_weight_scale,
+                self.quant_config.group_size,
+            )
+            layer.register_buffer("xsmm_bitmap", bitmap)
+            layer.register_buffer("xsmm_signs", signs)
+            layer.register_buffer("xsmm_sgn_off", sgn_off)
+            layer.register_buffer("xsmm_bitmap_scale", bscales)
+            # the int2 copy is dead once the bitmap form exists
+            layer.xsmm_packed_weight = None
+            layer.xsmm_weight_scale = None
+            global _BITMAP_LAYERS
+            _BITMAP_LAYERS += 1
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -317,6 +436,17 @@ class XsmmTernaryLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if not getattr(layer, "xsmm_ternary", False):
             return UnquantizedLinearMethod().apply(layer, x, bias)
+
+        if getattr(layer, "xsmm_bitmap", None) is not None:
+            return torch.ops._C.xsmm_ternary_bitmap_gemv(
+                x,
+                layer.xsmm_bitmap,
+                layer.xsmm_signs,
+                layer.xsmm_sgn_off,
+                layer.xsmm_bitmap_scale,
+                bias,
+                self.quant_config.group_size,
+            )
 
         if _REUSE_OUTPUT_BUFFER:
             return self._apply_reuse_out(layer, x, bias)
@@ -571,6 +701,56 @@ class XsmmTernaryMoEMethod(FusedMoEMethodBase):
             setattr(layer, f"{tag}_weight", packed)
             setattr(layer, f"xsmm_{tag}_scale", scale)
 
+        if _BITMAP and torch.ops._C.xsmm_ternary_bitmap_supported():
+            self._pack_bitmap_experts(layer, self.group_size)
+
+    @staticmethod
+    def _pack_bitmap_experts(layer: RoutedExperts, g: int) -> None:
+        """Pack every expert to the bitmap layout and splice the sign streams.
+
+        Each expert's sign run is byte-padded per group, so the per-expert
+        streams concatenate at byte boundaries and the offsets just shift by a
+        running bit total.
+        """
+        for tag in ("w13", "w2"):
+            packed = getattr(layer, f"{tag}_weight")
+            scale = getattr(layer, f"xsmm_{tag}_scale")
+
+            num_experts = packed.shape[0]
+            bm0, sg0, off0, sc0 = torch.ops._C.xsmm_ternary_bitmap_pack(
+                packed[0].contiguous(), scale[0].contiguous(), g
+            )
+            # sign runs are the only per-expert variable-length part; the rest
+            # is preallocated so no full second copy is ever live
+            bitmap = torch.empty((num_experts, *bm0.shape), dtype=bm0.dtype)
+            sgn_off = torch.empty((num_experts, *off0.shape), dtype=off0.dtype)
+            bscale = torch.empty((num_experts, *sc0.shape), dtype=sc0.dtype)
+            bitmap[0], sgn_off[0], bscale[0] = bm0, off0, sc0
+            sgs = [sg0]
+            bit_base = sg0.numel() * 8
+
+            for e in range(1, num_experts):
+                bm, sg, off, sc = torch.ops._C.xsmm_ternary_bitmap_pack(
+                    packed[e].contiguous(), scale[e].contiguous(), g
+                )
+                bitmap[e], bscale[e] = bm, sc
+                sgn_off[e] = off + bit_base
+                sgs.append(sg)
+                bit_base += sg.numel() * 8
+
+            setattr(layer, f"xsmm_{tag}_bitmap", bitmap)
+            # a few spare bytes so the 64-bit sign window read stays in bounds
+            setattr(
+                layer,
+                f"xsmm_{tag}_signs",
+                torch.cat(sgs + [torch.zeros(16, dtype=sg0.dtype)]),
+            )
+            setattr(layer, f"xsmm_{tag}_sgn_off", sgn_off)
+            setattr(layer, f"xsmm_{tag}_bscale", bscale)
+            setattr(layer, f"{tag}_weight", None)
+            setattr(layer, f"xsmm_{tag}_scale", None)
+        logger.info_once("xsmm_ternary: MoE experts packed to the bitmap layout")
+
     def get_fused_moe_quant_config(
         self, layer: RoutedExperts
     ) -> FusedMoEQuantConfig | None:
@@ -645,12 +825,34 @@ class XsmmTernaryMoEMethod(FusedMoEMethodBase):
             )
 
         g = self.group_size
-        w13, w2 = layer.w13_weight, layer.w2_weight
-        w13_scale, w2_scale = layer.xsmm_w13_scale, layer.xsmm_w2_scale
-
         x2 = x.reshape(-1, x.shape[-1])
         expert_map = layer.expert_map
         route_on_input = layer.apply_router_weight_on_input
+
+        if getattr(layer, "xsmm_w13_bitmap", None) is not None:
+            if route_on_input or expert_map is not None:
+                raise NotImplementedError(
+                    "bitmap MoE does not handle router-weight-on-input or "
+                    "expert parallelism yet"
+                )
+            out = torch.ops._C.xsmm_ternary_bitmap_moe(
+                x2,
+                topk_ids,
+                topk_weights,
+                layer.xsmm_w13_bitmap,
+                layer.xsmm_w13_signs,
+                layer.xsmm_w13_sgn_off,
+                layer.xsmm_w13_bscale,
+                layer.xsmm_w2_bitmap,
+                layer.xsmm_w2_signs,
+                layer.xsmm_w2_sgn_off,
+                layer.xsmm_w2_bscale,
+                g,
+            )
+            return out.view_as(x)
+
+        w13, w2 = layer.w13_weight, layer.w2_weight
+        w13_scale, w2_scale = layer.xsmm_w13_scale, layer.xsmm_w2_scale
 
         # The fused op handles routing weights on the output only; expert
         # parallelism would need the ids remapped first.

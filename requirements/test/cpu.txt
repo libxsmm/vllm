@@ -807,7 +807,7 @@ pygments==2.18.0
     # via
     #   pytest
     #   rich
-pyjwt==2.11.0
+pyjwt==2.15.0
     # via
     #   mcp
     #   msal

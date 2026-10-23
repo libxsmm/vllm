@@ -593,7 +593,7 @@ opencv-python-headless==4.13.0.90
     #   mistral-common
 openpyxl==3.1.5
     # via -r requirements/test/cuda.in
-opentelemetry-api==1.35.0
+opentelemetry-api==1.45.1
     # via
     #   -r requirements/test/../common.txt
     #   opentelemetry-exporter-otlp-proto-grpc

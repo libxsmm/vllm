@@ -292,7 +292,7 @@ googleapis-common-protos==1.70.0
     #   opentelemetry-exporter-otlp-proto-http
 gpt-oss==0.0.8
     # via -r requirements/test/cuda.in
-graphql-core==3.2.6
+graphql-core==3.2.12
     # via hypothesis-graphql
 greenlet==3.2.3
     # via sqlalchemy

@@ -234,7 +234,7 @@ fastrlock==0.8.2
     # via cupy-cuda12x
 fastsafetensors==0.3.3
     # via -r requirements/test/cuda.in
-filelock==3.16.1
+filelock==3.20.3
     # via
     #   -r requirements/test/../common.txt
     #   blobfile
